@@ -13,7 +13,7 @@ namespace config{
 
   using namespace cute;
 
-  template<typename Compute_Type, int KTileM_, int KTileN_, int KTileK_,int NThreads_,int KStage_>
+  template<typename Compute_Type, int KTileM_, int KTileN_, int KTileK_,int NThreads_>
   struct GemeConfig{
     static constexpr int kTileM = KTileM_; 
     static constexpr int kTileN = KTileN_; 
@@ -21,7 +21,6 @@ namespace config{
     static constexpr int NThreads = NThreads_;
     static_assert(kTileK%8==0);
     static constexpr int PerRowThreads = kTileK/8; // 4 * 8 = 32
-    static constexpr int kStage = KStage_;
     
     using T = Compute_Type;
     using mma_op = SM80_16x8x16_F16F16F16F16_TN;
@@ -29,16 +28,10 @@ namespace config{
     using mma_atom = MMA_Atom<mma_traits>;
     using TiledMMA = decltype(make_tiled_mma(mma_atom{}, 
                       make_layout(Shape<_2, _2, _1>{}), 
-                      make_layout(Shape<_1, _2, _2>{})));
+                      make_layout(Shape<_1, _2, _1>{})));
 
-    using SmemALayout = decltype(Layout<
-        Shape <Int<kTileM>, Int<kTileK>, Int<kStage>>,
-        Stride<Int<kTileK>, _1,          Int<kTileM * kTileK>>>{});
-
-    using SmemBLayout = decltype(Layout<
-        Shape <Int<kTileN>, Int<kTileK>, Int<kStage>>,
-        Stride<Int<kTileK>, _1,          Int<kTileN * kTileK>>>{});
-    
+    using SmemALayout = decltype(Layout<Shape<Int<kTileM>,Int<kTileK>>,Stride<Int<kTileK>,_1>>{});
+    using SmemBLayout = decltype(Layout<Shape<Int<kTileN>,Int<kTileK>>,Stride<Int<kTileK>,_1>>{});
     using Gcopy = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, T>;  
     using GmemTiledCopy = decltype(make_tiled_copy(
           Gcopy{},
@@ -66,7 +59,6 @@ __global__ void gemm_simple(void *Cptr, const void *Aptr, const void *Bptr, int 
   const int tid = threadIdx.x;
 
   static_assert(sizeof(T) * Config::kTileK <= 128 ); //确保一个cache line可以放下
-  static_assert(Config::kStage == 2); //确保双缓冲
 
 
   Tensor sA = make_tensor(make_smem_ptr(smem),typename Config::SmemALayout{});
@@ -91,6 +83,8 @@ __global__ void gemm_simple(void *Cptr, const void *Aptr, const void *Bptr, int 
   typename Config::GmemTiledCopy gmemcopy;
   auto thr_mma = tiled_mma.get_slice(threadIdx.x);
   auto g2s_copy_ab = gmemcopy.get_slice(tid);
+  // auto tAgA = thr_mma.partition_A(gA);  
+  // auto tBgB = thr_mma.partition_B(gB);  
 
   auto tAgA = g2s_copy_ab.partition_S(gA);
   auto tBgB = g2s_copy_ab.partition_S(gB);
@@ -103,69 +97,45 @@ __global__ void gemm_simple(void *Cptr, const void *Aptr, const void *Bptr, int 
   auto tBsB = g2s_copy_ab.partition_D(sB);  
 
   auto tCrC = thr_mma.partition_fragment_C(gC(_, _));     // (MMA, MMA_M, MMA_N)
-  Tensor tAsA_mma = thr_mma.partition_A(sA);
-  Tensor tBsB_mma = thr_mma.partition_B(sB);
  
   clear(tCrC);
   
   const int num_tile_k = size<2>(gA);
-  if(num_tile_k > 1)
-  {
-    copy(gmemcopy, tAgA(_,_,_,0), tAsA(_,_,_,0));
-    copy(gmemcopy, tBgB(_,_,_,0), tBsB(_,_,_,0));
-    cute::cp_async_fence(); // 提交异步拷贝
-  }
-
-  int write_stage = 1; // 下一次写入 Stage 1
-  int read_stage = 0;  // 下一次读取 Stage 0
-
-  for(int itile = 0; itile < num_tile_k - 1; ++itile) {
+ // {{ edit_4 }} 重写循环逻辑：单级缓存必须串行执行 (Load -> Wait -> Compute)
+  // 之前的流水线写法会覆盖数据导致错误
+  for(int itile = 0; itile < num_tile_k; ++itile) {
     // 1. Global -> Shared
-    copy(gmemcopy, tAgA(_,_,_,itile+1), tAsA(_,_,_,write_stage));
-    copy(gmemcopy, tBgB(_,_,_,itile+1), tBsB(_,_,_,write_stage));
-    cute::cp_async_fence();
-
+    copy(gmemcopy, tAgA(_,_,_,itile), tAsA);
+    copy(gmemcopy, tBgB(_,_,_,itile), tBsB);
     
-    // 等待当前计算所需的数据 (read_stage) 就绪
-    // wait<1> 表示：等待直到只剩下 1 个 batch 在 flight (即刚刚提交的那个 write_stage)
-    // 这样 read_stage 就一定加载完成了
-    cute::cp_async_wait<1>(); 
+    // 2. 等待拷贝完成 (因为只有一个 buffer，必须等写完才能读)
+    cute::cp_async_fence();
+    cute::cp_async_wait<0>();
     __syncthreads();
-
 
     // 3. Shared -> Register
     // 注意：tAsA 是 Copy线程的视图，不能直接 copy 到 MMA线程的寄存器 tArA
     // 需要创建 MMA 视角的 Smem 视图
+    Tensor tAsA_mma = thr_mma.partition_A(sA);
+    Tensor tBsB_mma = thr_mma.partition_B(sB);
     
-    Tensor tArA = thr_mma.partition_fragment_A(sA(_,_,read_stage)); 
-    Tensor tBrB = thr_mma.partition_fragment_B(sB(_,_,read_stage));
-    copy(tAsA_mma(_,_,_,read_stage), tArA); 
-    copy(tBsB_mma(_,_,_,read_stage), tBrB);
+    Tensor tArA = thr_mma.partition_fragment_A(sA); 
+    Tensor tBrB = thr_mma.partition_fragment_B(sB);
+
+    copy(tAsA_mma, tArA); 
+    copy(tBsB_mma, tBrB);
 
     // 4. Compute
     cute::gemm(tiled_mma, tCrC, tArA, tBrB, tCrC);
-
-    __syncthreads();
     
-    // 切换 Stage
-    write_stage ^= 1;
-    read_stage ^= 1;
+    // 5. 同步，防止下一轮 Load 覆盖当前正在计算的数据
+    __syncthreads();
   }
-  // 3. Epilogue: 处理最后一个 Tile
-  // 此时不需要再预取了，只需要等待最后一个 Tile 加载完成
-  cute::cp_async_wait<0>();
-  __syncthreads();
-
-  {
-    Tensor tArA = thr_mma.partition_fragment_A(sA(_,_,read_stage)); 
-    Tensor tBrB = thr_mma.partition_fragment_B(sB(_,_,read_stage));
-    copy(tAsA_mma(_,_,_,read_stage), tArA); 
-    copy(tBsB_mma(_,_,_,read_stage), tBrB);
-    cute::gemm(tiled_mma, tCrC, tArA, tBrB, tCrC);
-  }
+  // {{ edit_5 }} 删除 Epilogue 代码，因为上面的循环已经包含了所有 tile
+  // ... deleted code ...
 
   // 8. 将最终结果从寄存器写回全局内存
-  cute::copy(tCrC, tCgC);
+  cute::copy(tCrC, tCgC); 
 }
 
 int main() {
@@ -196,7 +166,7 @@ int main() {
   cudaMemcpy(Aptr, Aptr_host, sizeof(T) * m * k, cudaMemcpyHostToDevice);
   cudaMemcpy(Bptr, Bptr_host, sizeof(T) * n * k, cudaMemcpyHostToDevice);
 
-  using Config = config::GemeConfig<T, 128, 128, 32, 128, 2>; //double buffer
+  using Config = config::GemeConfig<T, 128, 128, 32, 128>;
   Config cf;
 
   int smem_size = sizeof(T) * (cosize(Config::SmemALayout{}) + cosize(Config::SmemBLayout{}));
