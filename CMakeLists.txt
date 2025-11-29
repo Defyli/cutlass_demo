@@ -15,7 +15,7 @@ find_package(CUDA REQUIRED)
 # 86 for Ampere (RTX 30xx)
 # 89 for Ada Lovelace (RTX 40xx)
 # 请根据你的 GPU 型号修改此值
-set(CMAKE_CUDA_ARCHITECTURES 89)
+set(CMAKE_CUDA_ARCHITECTURES 86)
 set(COMMON_NVCC_FLAGS "-O3 --use_fast_math --expt-relaxed-constexpr --expt-extended-lambda --ptxas-options=-v --generate-line-info -Xcompiler=-fPIC -Xcompiler=-fopenmp")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${COMMON_CXX_FLAGS}")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${COMMON_NVCC_FLAGS}")
@@ -35,4 +35,4 @@ target_include_directories(cutlass_simple_demo PRIVATE
 
 
 # 链接 CUTLASS 和 CUDA 运行时库
-target_link_libraries(cutlass_simple_demo PRIVATE cudart CUDA::cublas)
+target_link_libraries(cutlass_simple_demo PRIVATE cudart -lcublas)
