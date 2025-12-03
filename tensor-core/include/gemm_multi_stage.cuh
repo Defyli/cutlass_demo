@@ -19,7 +19,7 @@ struct GemmConfig {
     static constexpr int NThreads = NThreads_;
     static_assert(kTileK%8==0);
     static constexpr int PerRowThreads = kTileK/8; // 4 * 8 = 32
-    static constexpr int kStage = kStage_;
+    static constexpr int kStage = KStage_;
 
     using ComputeType = T;
     using MMA_Op = SM80_16x8x16_F16F16F16F16_TN;

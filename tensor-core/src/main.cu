@@ -109,7 +109,7 @@ int main() {
     printf("Simple: \t%.3f ms \t%.2f TFLOPS\n", ms_simple, tflops / (ms_simple * 1e-3));
 
     // 3. Run Double Buffer
-    using ConfigDouble = gemm_double_buffer::GemmConfig<T, 128, 128, 32 128>;
+    using ConfigDouble = gemm_double_buffer::GemmConfig<T, 128, 128, 32,128>;
     int smem_double = sizeof(T) * (cute::size(typename ConfigDouble::SmemLayoutA{}) + cute::size(typename ConfigDouble::SmemLayoutB{}));
     
     CUDA_CHECK(cudaMemset(d_C, 0, bytes_C));
