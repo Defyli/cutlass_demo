@@ -1,0 +1,7 @@
+[submodule "cutlass"]
+	path = cutlass
+	url = https://github.com/NVIDIA/cutlass.git
+
+[submodule "cute-gemm"]
+    path = cute-gemm
+    url = https://github.com/reed-lau/cute-gemm.git

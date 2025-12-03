@@ -31,23 +31,13 @@ namespace config{
                       make_layout(Shape<_2, _2, _1>{}), 
                       make_layout(Shape<_1, _2, _2>{})));
 
-    // 定义 SmemLayoutAtom: 这是一个经过 Swizzle 处理的原子布局
-    // 基础布局是 (M=8, K=TileK)，Stride 是 (K, 1) -> Row Major
-    using SmemLayoutAtom = decltype(composition(
-        Swizzle<3, 3, 3>{},
-        make_layout(make_shape(Int<8>{}, Int<kTileK>{}),
-                    make_stride(Int<kTileK>{}, Int<1>{}))));
+    using SmemALayout = decltype(Layout<
+        Shape <Int<kTileM>, Int<kTileK>, Int<kStage>>,
+        Stride<Int<kTileK>, _1,          Int<kTileM * kTileK>>>{});
 
-    // 使用 tile_to_shape 将原子布局平铺到整个 Shared Memory 区域
-    // 注意：tile_to_shape 会自动处理重复和拼接
-    using SmemALayout = decltype(tile_to_shape(
-        SmemLayoutAtom{},
-        make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStage>{})));
-
-    using SmemBLayout = decltype(tile_to_shape(
-        SmemLayoutAtom{},
-        make_shape(Int<kTileN>{}, Int<kTileK>{}, Int<kStage>{})));
-
+    using SmemBLayout = decltype(Layout<
+        Shape <Int<kTileN>, Int<kTileK>, Int<kStage>>,
+        Stride<Int<kTileK>, _1,          Int<kTileN * kTileK>>>{});
     
     using Gcopy = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, T>;  
     using GmemTiledCopy = decltype(make_tiled_copy(
@@ -56,9 +46,6 @@ namespace config{
           Layout<Shape<_1,_8>>{}
     ));
   };
-
-    using S2RCopy = Copy_Atom<SM75_U32x4_LDSM_N, T>
-
 
 }
 
@@ -102,41 +89,23 @@ __global__ void gemm_simple(void *Cptr, const void *Aptr, const void *Bptr, int 
 
   typename Config::TiledMMA tiled_mma;
   typename Config::GmemTiledCopy gmemcopy;
-  auto thr_mma = tiled_mma.get_slice(threadIdx.x);  //ThrMMA: 1. partition_C, partition_A, partition_B 2. partition_fragment_C, partition_fragment_A, partition_fragment_B
-  auto g2s_copy_ab = gmemcopy.get_slice(tid);// ThrCopy  : 1. partition_S 2.partition_D 3.retile_D
+  auto thr_mma = tiled_mma.get_slice(threadIdx.x);
+  auto g2s_copy_ab = gmemcopy.get_slice(tid);
 
-  
-  // global -- >  smem 128bit read
   auto tAgA = g2s_copy_ab.partition_S(gA);
   auto tBgB = g2s_copy_ab.partition_S(gB);
   // (MMA, MMA_M, MMA_K, num_tile_k)
   // (MMA, MMA_N, MMA_K, num_tile_k)
+
+  auto tCgC = thr_mma.partition_C(gC);  // (MMA, MMA_M, MMA_N)
+
   auto tAsA = g2s_copy_ab.partition_D(sA); 
   auto tBsB = g2s_copy_ab.partition_D(sB);  
 
-
-  // smem --> registers
-  auto s2r_copy_a = make_tiled_copy_A(typename Congfig::S2RCopy{}, tiled_mma);
-  auto s2r_copy_a = make_tiled_copy_B(typename Congfig::S2RCopy{}, tiled_mma);
-
-  auto s2r_thr_a = s2r_copy_a.get_slice(tid);
-  auto s2r_thr_b = s2r_copy_b.get_slice(tid);
-
-  auto tXs·A = s2r_thr_a.partition_S(sA);//view
-  auto tXsB = s2r_thr_b.partition_S(sB);
-  auto tCrA = thr_mma.partition_fragment_A(sA(_,_,0)); // alloc space
-  auto tCrB = thr_mma.partition_fragment_B(sB(_,_,0)); 
-
-  // 关键：创建 S2R 的目标 (Register) 视图
-  // 我们需要用 Copy 对象去 "重新切分" (retile) MMA 的寄存器
-  // 这样 copy() 函数才知道如何用 ldmatrix 填充这些寄存器
-  auto tCrA_view = s2r_thr_a.retile_D(tCrA);
-  auto tCrB_view = s2r_thr_b.retile_D(tCrB);
-
-
-  Tensor tCgC = thr_mma.partition_C(gC);  // (MMA, MMA_M, MMA_N)
   auto tCrC = thr_mma.partition_fragment_C(gC(_, _));     // (MMA, MMA_M, MMA_N)
-
+  Tensor tAsA_mma = thr_mma.partition_A(sA);
+  Tensor tBsB_mma = thr_mma.partition_B(sB);
+ 
   clear(tCrC);
   
   const int num_tile_k = size<2>(gA);
@@ -168,11 +137,13 @@ __global__ void gemm_simple(void *Cptr, const void *Aptr, const void *Bptr, int 
     // 注意：tAsA 是 Copy线程的视图，不能直接 copy 到 MMA线程的寄存器 tArA
     // 需要创建 MMA 视角的 Smem 视图
     
-    cute::copy(s2r_copy_a, tXsA(_,_,_,read_stage), tCrA_view);
-    cute::copy(s2r_copy_b, tXsB(_,_,_,read_stage), tCrB_view);
+    Tensor tArA = thr_mma.partition_fragment_A(sA(_,_,read_stage)); 
+    Tensor tBrB = thr_mma.partition_fragment_B(sB(_,_,read_stage));
+    copy(tAsA_mma(_,_,_,read_stage), tArA); 
+    copy(tBsB_mma(_,_,_,read_stage), tBrB);
 
     // 4. Compute
-    cute::gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC);
+    cute::gemm(tiled_mma, tCrC, tArA, tBrB, tCrC);
 
     __syncthreads();
     
@@ -186,12 +157,12 @@ __global__ void gemm_simple(void *Cptr, const void *Aptr, const void *Bptr, int 
   __syncthreads();
 
   {
-    // {{ edit_4 }} Epilogue 同样使用 ldmatrix
-    cute::copy(s2r_copy_a, tXsA(_,_,_,read_stage), tCrA_view);
-    cute::copy(s2r_copy_b, tXsB(_,_,_,read_stage), tCrB_view);
-    cute::gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC);
+    Tensor tArA = thr_mma.partition_fragment_A(sA(_,_,read_stage)); 
+    Tensor tBrB = thr_mma.partition_fragment_B(sB(_,_,read_stage));
+    copy(tAsA_mma(_,_,_,read_stage), tArA); 
+    copy(tBsB_mma(_,_,_,read_stage), tBrB);
+    cute::gemm(tiled_mma, tCrC, tArA, tBrB, tCrC);
   }
-
 
   // 8. 将最终结果从寄存器写回全局内存
   cute::copy(tCrC, tCgC);
@@ -226,11 +197,9 @@ int main() {
   cudaMemcpy(Bptr, Bptr_host, sizeof(T) * n * k, cudaMemcpyHostToDevice);
 
   using Config = config::GemeConfig<T, 128, 128, 32, 128, 2>; //double buffer
-
   Config cf;
 
   int smem_size = sizeof(T) * (cosize(Config::SmemALayout{}) + cosize(Config::SmemBLayout{}));
-  //32 KB
 
 
   cudaEvent_t start, stop;
@@ -263,19 +232,16 @@ int main() {
 
   half alpha = half(1.f);
   half beta = half(0.f);
-  cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);
+
   cudaEventRecord(start);
-  
   for (int i = 0; i < 100; ++i) {
-    cublasStatus_t ret = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-             n, m, k,
-             &alpha,
-             Bptr, CUDA_R_16F, k,
-             Aptr, CUDA_R_16F, k,
-             &beta,
-             Cptr_cublas, CUDA_R_16F, n,
-             CUBLAS_COMPUTE_16F, // 或者 CUBLAS_COMPUTE_32F 如果你想用 FP32 累加
-             CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    cublasStatus_t ret = cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+          	  n, m, k,
+          	  &alpha,
+          	  (half *)Bptr, k,
+          	  (half *)Aptr, k,
+          	  &beta,
+          	  (half *)Cptr_cublas, n);
     if (ret != CUBLAS_STATUS_SUCCESS) {
       printf("blas err = %d, str = %s\n", ret, cublasGetStatusString(ret));
     }
