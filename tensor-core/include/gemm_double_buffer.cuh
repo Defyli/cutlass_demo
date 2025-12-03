@@ -61,7 +61,7 @@ __global__ void gemm_kernel(void* Cptr, const void* Aptr, const void* Bptr, int 
     Tensor gC = local_tile(C, make_tile(Int<Config::kTileM>{}, Int<Config::kTileN>{}), make_coord(iy, ix));
 
     Tensor sA = make_tensor(make_smem_ptr(smem), typename Config::SmemLayoutA{});
-    Tensor sB = make_tensor(make_smem_ptr(sA.data() + sA.size(), typename Config::SmemLayoutB{}));
+    Tensor sB = make_tensor(make_smem_ptr(sA.data() + sA.size()), typename Config::SmemLayoutB{});
 
     typename Config::TiledMMA tiled_mma;
     typename Config::GmemTiledCopy gmem_copy;
