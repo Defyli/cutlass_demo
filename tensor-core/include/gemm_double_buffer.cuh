@@ -5,7 +5,7 @@ namespace gemm_double_buffer {
 
 using namespace cute;
 
-template <typename T, int kTileM_, int kTileN_, int kTileK_,int NThreads_>
+template <typename T, int KTileM_, int KTileN_, int KTileK_,int NThreads_>
 struct GemmConfig {
     static constexpr int kStage = 2; // Double Buffer
     static constexpr int kTileM = KTileM_; 

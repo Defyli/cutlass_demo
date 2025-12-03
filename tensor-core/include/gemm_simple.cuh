@@ -10,7 +10,7 @@ namespace gemm_simple {
 
 using namespace cute;
 
-template <typename T, int kTileM_, int kTileN_, int kTileK_, int NThreads_>
+template <typename T, int KTileM_, int KTileN_, int KTileK_, int NThreads_>
 struct GemmConfig {
     static constexpr int kTileM = KTileM_; 
     static constexpr int kTileN = KTileN_; 

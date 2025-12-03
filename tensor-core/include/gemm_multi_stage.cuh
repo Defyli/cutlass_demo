@@ -10,7 +10,7 @@ namespace gemm_multi_stage {
 
 using namespace cute;
 
-template <typename T, int kTileM_, int kTileN_, int kTileK_, int kStage_, int NThreads_>
+template <typename T, int KTileM_, int KTileN_, int KTileK_, int KStage_, int NThreads_>
 struct GemmConfig {
 
     static constexpr int kTileM = KTileM_; 
