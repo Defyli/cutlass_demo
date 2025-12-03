@@ -15,45 +15,26 @@ void run_cublas(cublasHandle_t handle, T* d_A, T* d_B, T* d_C, int M, int N, int
     half alpha = 1.0f;
     half beta = 0.0f;
     
-    // Kernel 视角 (Row Major):
-    // A: (M, K)
-    // B: (N, K) -> 实际上是 (K, N) 的转置
-    // C: (M, N)
-    // Op: C = A * B^T
     
-    // cuBLAS 视角 (Col Major):
-    // 我们希望得到 C_row (即 C_col^T)
-    // C^T = (A * B^T)^T = B * A^T
-    // 所以我们让 cuBLAS 计算: C_col = B_col * A_col^T
-    
-    // 映射关系:
-    // Kernel A (Row) (M, K) -> cuBLAS A_col (K, M) (即 d_A 指针)
-    // Kernel B (Row) (N, K) -> cuBLAS B_col (K, N) (即 d_B 指针)
-    
-    // 我们需要计算 B_col * A_col^T
-    // cuBLAS 参数: gemm(transa, transb, m, n, k, ...)
-    // 这里 m, n 是结果矩阵的维度。结果是 (N, M) (在 Col Major 下)
-    // 也就是 Kernel 的 (M, N) (在 Row Major 下)
-    
-    // 修正后的调用:
-    // m_blas = N
-    // n_blas = M
-    // k_blas = K
-    // A_blas = d_B (K x N) -> No Trans
-    // B_blas = d_A (K x M) -> Trans (变成 M x K)
-    
-    cublasStatus_t ret = cublasGemmEx(handle, 
-                 CUBLAS_OP_N,  // A_blas (d_B) 不需要转置
-                 CUBLAS_OP_T,  // B_blas (d_A) 需要转置
-                 N, M, K,      // m, n, k
-                 &alpha,
-                 d_B, CUDA_R_16F, K, // LDA
-                 d_A, CUDA_R_16F, K, // LDB
-                 &beta,
-                 d_C, CUDA_R_16F, N, // LDC
-                 CUBLAS_COMPUTE_16F, // 使用 FP16 计算，匹配 Kernel
-                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    // cublasStatus_t ret = cublasGemmEx(handle, 
+    //              CUBLAS_OP_N,  // A_blas (d_B) 不需要转置
+    //              CUBLAS_OP_T,  // B_blas (d_A) 需要转置
+    //              N, M, K,      // m, n, k
+    //              &alpha,
+    //              d_B, CUDA_R_16F, K, // LDA
+    //              d_A, CUDA_R_16F, K, // LDB
+    //              &beta,
+    //              d_C, CUDA_R_16F, N, // LDC
+    //              CUBLAS_COMPUTE_16F, // 使用 FP16 计算，匹配 Kernel
+    //              CUBLAS_GEMM_DEFAULT_TENSOR_OP);
                  
+    cublasStatus_t ret = cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, K, 
+            &alpha,
+            (half *)d_B, K,
+            (half *)d_A, K,
+            &beta,
+            (half *)d_C, N);
     if (ret != CUBLAS_STATUS_SUCCESS) {
         printf("cuBLAS Error: %d\n", ret);
     }
