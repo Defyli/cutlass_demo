@@ -92,8 +92,12 @@ __global__ void gemm_kernel(void* Cptr, const void* Aptr, const void* Bptr, int 
         auto tCrB = thr_mma.partition_fragment_B(sB);
         
         // 这里的 copy 依赖编译器优化为 LDS
-        copy(tAsA, tCrA); // 逻辑上不对，但简单版通常这么写，实际上应该用 thr_mma.partition_A(sA)
-        copy(tBsB, tCrB);
+        auto tAsA_mma = thr_mma.partition_A(sA);
+        auto tBsB_mma = thr_mma.partition_B(sB);
+
+        copy(tAsA_mma, tCrA); 
+        copy(tBsB_mma, tCrB);
+
 
         // 3. Compute
         gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC);
