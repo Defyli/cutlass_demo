@@ -10,8 +10,17 @@ namespace gemm_multi_stage {
 
 using namespace cute;
 
-template <typename T, int kTileM, int kTileN, int kTileK, int kStage>
+template <typename T, int kTileM_, int kTileN_, int kTileK_, int kStage_, int NThreads_>
 struct GemmConfig {
+
+    static constexpr int kTileM = KTileM_; 
+    static constexpr int kTileN = KTileN_; 
+    static constexpr int kTileK = KTileK_; 
+    static constexpr int NThreads = NThreads_;
+    static_assert(kTileK%8==0);
+    static constexpr int PerRowThreads = kTileK/8; // 4 * 8 = 32
+    static constexpr int kStage = kStage_;
+
     using ComputeType = T;
     using MMA_Op = SM80_16x8x16_F16F16F16F16_TN;
     using MMA_Traits = MMA_Traits<MMA_Op>;
@@ -37,9 +46,9 @@ struct GemmConfig {
 
     using GmemCopyAtom = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, T>;
     using GmemTiledCopy = decltype(make_tiled_copy(
-        GmemCopyAtom{},
-        Layout<Shape<Int<32>, Int<4>>, Stride<Int<4>, _1>>{},
-        Layout<Shape<_1, _8>>{}
+          GmemCopyAtom{},
+          Layout<Shape<Int<NThreads/PerRowThreads>,Int<PerRowThreads>>,Stride<Int<PerRowThreads>,_1>>{},
+          Layout<Shape<_1,_8>>{}
     ));
 
     // Ldmatrix Copy Atoms
@@ -54,6 +63,8 @@ __global__ void gemm_kernel(void* Cptr, const void* Aptr, const void* Bptr, int 
     using T = typename GemmConfig::ComputeType;
     extern __shared__ char smem_buf[];
     T* smem = reinterpret_cast<T*>(smem_buf);
+
+    static_assert(sizeof(T) * Config::kTileK <= 128 ); //确保一个cache line可以放下
 
     Tensor A = make_tensor(make_gmem_ptr(reinterpret_cast<const T*>(Aptr)), make_shape(m, k), make_stride(k, Int<1>{}));
     Tensor B = make_tensor(make_gmem_ptr(reinterpret_cast<const T*>(Bptr)), make_shape(n, k), make_stride(k, Int<1>{}));
