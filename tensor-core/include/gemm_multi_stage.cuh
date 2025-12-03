@@ -22,7 +22,7 @@ struct GemmConfig {
     static constexpr int kStage = KStage_;
 
     using ComputeType = T;
-    using MMA_Op = SM80_16x8x16_F32F16F16F32_TN;
+    using MMA_Op = SM80_16x8x16_F16F16F16F16_TN;
     using MMA_Traits = MMA_Traits<MMA_Op>;
     using MMA_Atom = MMA_Atom<MMA_Traits>;
     
@@ -32,7 +32,7 @@ struct GemmConfig {
 
     // Swizzle Layout for Shared Memory
     using SmemLayoutAtom = decltype(composition(
-        Swizzle<2, 3, 3>{},
+        Swizzle<3, 3, 3>{},
         make_layout(make_shape(Int<8>{}, Int<kTileK>{}),
                     make_stride(Int<kTileK>{}, Int<1>{}))));
 

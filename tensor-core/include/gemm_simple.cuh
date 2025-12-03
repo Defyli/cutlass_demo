@@ -20,7 +20,7 @@ struct GemmConfig {
     static constexpr int PerRowThreads = kTileK/8; // 4 * 8 = 32
     
     using ComputeType = T;
-    using MMA_Op = SM80_16x8x16_F32F16F16F32_TN;
+    using MMA_Op = SM80_16x8x16_F16F16F16F16_TN;
     using MMA_Traits = MMA_Traits<MMA_Op>;
     using MMA_Atom = MMA_Atom<MMA_Traits>;
     
@@ -88,16 +88,11 @@ __global__ void gemm_kernel(void* Cptr, const void* Aptr, const void* Bptr, int 
         __syncthreads();
 
         // 2. Load Shared -> Register
-        auto tCrA = thr_mma.partition_fragment_A(sA);
-        auto tCrB = thr_mma.partition_fragment_B(sB);
-        
-        // 这里的 copy 依赖编译器优化为 LDS
         auto tAsA_mma = thr_mma.partition_A(sA);
         auto tBsB_mma = thr_mma.partition_B(sB);
 
         copy(tAsA_mma, tCrA); 
         copy(tBsB_mma, tCrB);
-
 
         // 3. Compute
         gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC);
