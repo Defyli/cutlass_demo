@@ -51,7 +51,7 @@ struct GemmConfig {
 
 template <typename Config>
 __global__ void gemm_kernel(void* Cptr, const void* Aptr, const void* Bptr, int m, int n, int k) {
-    using T = typename GemmConfig::ComputeType
+    using T = typename GemmConfig::ComputeType;
     extern __shared__ char smem_buf[];
     T* smem = reinterpret_cast<T*>(smem_buf);
 
