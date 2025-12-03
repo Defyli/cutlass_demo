@@ -15,7 +15,7 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --use_fast_math --expt-relaxed-con
 # 包含目录
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/cutlass/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cutlass/include
     ${CMAKE_CURRENT_SOURCE_DIR}/cutlass/tools/util/include
 )
 
