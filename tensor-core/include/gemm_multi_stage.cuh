@@ -12,6 +12,7 @@ using namespace cute;
 
 template <typename T, int kTileM, int kTileN, int kTileK, int kStage>
 struct GemmConfig {
+    using ComputeType = T;
     using MMA_Op = SM80_16x8x16_F16F16F16F16_TN;
     using MMA_Traits = MMA_Traits<MMA_Op>;
     using MMA_Atom = MMA_Atom<MMA_Traits>;
@@ -50,13 +51,13 @@ struct GemmConfig {
 
 template <typename Config>
 __global__ void gemm_kernel(void* Cptr, const void* Aptr, const void* Bptr, int m, int n, int k) {
-    using T = typename std::remove_pointer<decltype(Cptr)>::type;
+    using T = typename GemmConfig::ComputeType
     extern __shared__ char smem_buf[];
     T* smem = reinterpret_cast<T*>(smem_buf);
 
-    Tensor A = make_tensor(make_gmem_ptr((const T*)Aptr), make_shape(m, k), make_stride(k, Int<1>{}));
-    Tensor B = make_tensor(make_gmem_ptr((const T*)Bptr), make_shape(n, k), make_stride(k, Int<1>{}));
-    Tensor C = make_tensor(make_gmem_ptr((T*)Cptr), make_shape(m, n), make_stride(n, Int<1>{}));
+    Tensor A = make_tensor(make_gmem_ptr(reinterpret_cast<const T*>(Aptr)), make_shape(m, k), make_stride(k, Int<1>{}));
+    Tensor B = make_tensor(make_gmem_ptr(reinterpret_cast<const T*>(Bptr)), make_shape(n, k), make_stride(k, Int<1>{}));
+    Tensor C = make_tensor(make_gmem_ptr(reinterpret_cast<T*>(Cptr)), make_shape(m, n), make_stride(n, Int<1>{}));
 
     int ix = blockIdx.x;
     int iy = blockIdx.y;
