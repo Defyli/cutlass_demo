@@ -78,6 +78,11 @@ __global__ void gemm_kernel(void* Cptr, const void* Aptr, const void* Bptr, int 
 
     int num_tile_k = size<2>(gA);
 
+    if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0)
+    {
+        print("tAgA shape");print(tAgA.shape());print("\n");
+    }
+
     for(int itile = 0; itile < num_tile_k; ++itile) {
         // 1. Load Global -> Shared
         copy(gmem_copy, tAgA(_,_,_,itile), tAsA);

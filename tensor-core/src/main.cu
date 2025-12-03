@@ -15,19 +15,7 @@ void run_cublas(cublasHandle_t handle, T* d_A, T* d_B, T* d_C, int M, int N, int
     half alpha = 1.0f;
     half beta = 0.0f;
     
-    
-    // cublasStatus_t ret = cublasGemmEx(handle, 
-    //              CUBLAS_OP_N,  // A_blas (d_B) 不需要转置
-    //              CUBLAS_OP_T,  // B_blas (d_A) 需要转置
-    //              N, M, K,      // m, n, k
-    //              &alpha,
-    //              d_B, CUDA_R_16F, K, // LDA
-    //              d_A, CUDA_R_16F, K, // LDB
-    //              &beta,
-    //              d_C, CUDA_R_16F, N, // LDC
-    //              CUBLAS_COMPUTE_16F, // 使用 FP16 计算，匹配 Kernel
-    //              CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-                 
+
     cublasStatus_t ret = cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
             N, M, K, 
             &alpha,
@@ -65,7 +53,7 @@ float benchmark(KernelFunc func, int n_iter) {
 int main() {
     int M = 4096;
     int N = 4096;
-    int K = 4096;
+    int K = 1024;
 
     printf("Benchmarking GEMM FP16: M=%d, N=%d, K=%d\n", M, N, K);
 
