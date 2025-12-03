@@ -147,10 +147,11 @@ __global__ void gemm_kernel(void* Cptr, const void* Aptr, const void* Bptr, int 
         smem_read_stage = (smem_read_stage + 1) % k_stage;
     }
 
+    cp_async_wait<0>();
+    __syncthreads();
+
     // Epilogue (Drain pipeline)
     for(int i = 0; i < k_stage - 1; ++i) {
-        cp_async_wait<Config::kStage - 2>();
-        __syncthreads();
 
         copy(s2r_copy_a, tXsA(_,_,_,smem_read_stage), tCrA_view);
         copy(s2r_copy_b, tXsB(_,_,_,smem_read_stage), tCrB_view);
