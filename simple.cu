@@ -49,7 +49,6 @@ template <typename Config>
 __global__ void gemm_simple(void *Cptr, const void *Aptr, const void *Bptr, int m, int n, int k) {
 
 
-
   using namespace cute;
 
 

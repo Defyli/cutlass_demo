@@ -20,7 +20,7 @@ struct GemmConfig {
     static constexpr int PerRowThreads = kTileK/8; // 4 * 8 = 32
     
     using ComputeType = T;
-    using MMA_Op = SM80_16x8x16_F16F16F16F16_TN;
+    using MMA_Op = SM80_16x8x16_F32F16F16F32_TN;
     using MMA_Traits = MMA_Traits<MMA_Op>;
     using MMA_Atom = MMA_Atom<MMA_Traits>;
     

@@ -51,7 +51,7 @@ void run_cublas(cublasHandle_t handle, T* d_A, T* d_B, T* d_C, int M, int N, int
                  d_A, CUDA_R_16F, K, // LDB (d_A 的 leading dim 是 K)
                  &beta,
                  d_C, CUDA_R_16F, N, // LDC (d_C 的 leading dim 是 N)
-                 CUBLAS_COMPUTE_16F,
+                 CUBLAS_COMPUTE_32F,
                  CUBLAS_GEMM_DEFAULT_TENSOR_OP);
                  
     if (ret != CUBLAS_STATUS_SUCCESS) {
