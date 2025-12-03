@@ -91,7 +91,7 @@ __global__ void gemm_kernel(void* Cptr, const void* Aptr, const void* Bptr, int 
         auto tCrA = thr_mma.partition_fragment_A(sA);
         auto tCrB = thr_mma.partition_fragment_B(sB);
         
-        // {{ edit_1 }} 修复：创建 MMA 视角的 Smem 视图
+
         // 之前的代码错误地使用了 tAsA (Copy线程视图)
         auto tAsA_mma = thr_mma.partition_A(sA);
         auto tBsB_mma = thr_mma.partition_B(sB);

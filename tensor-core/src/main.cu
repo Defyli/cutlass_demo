@@ -43,15 +43,15 @@ void run_cublas(cublasHandle_t handle, T* d_A, T* d_B, T* d_C, int M, int N, int
     // B_blas = d_A (K x M) -> Trans (变成 M x K)
     
     cublasStatus_t ret = cublasGemmEx(handle, 
-                 CUBLAS_OP_T,  // B_blas (d_A) 需要转置: (K, M) -> (M, K)
-                 CUBLAS_OP_N,  // A_blas (d_B) 不需要转置: (K, N)
-                 N, M, K,      // m, n, k (注意 m, n 互换了，因为是 C^T)
+                 CUBLAS_OP_N,  // A_blas (d_B) 不需要转置
+                 CUBLAS_OP_T,  // B_blas (d_A) 需要转置
+                 N, M, K,      // m, n, k
                  &alpha,
-                 d_B, CUDA_R_16F, K, // LDA (d_B 的 leading dim 是 K)
-                 d_A, CUDA_R_16F, K, // LDB (d_A 的 leading dim 是 K)
+                 d_B, CUDA_R_16F, K, // LDA
+                 d_A, CUDA_R_16F, K, // LDB
                  &beta,
-                 d_C, CUDA_R_16F, N, // LDC (d_C 的 leading dim 是 N)
-                 CUBLAS_COMPUTE_32F,
+                 d_C, CUDA_R_16F, N, // LDC
+                 CUBLAS_COMPUTE_16F, // 使用 FP16 计算，匹配 Kernel
                  CUBLAS_GEMM_DEFAULT_TENSOR_OP);
                  
     if (ret != CUBLAS_STATUS_SUCCESS) {
