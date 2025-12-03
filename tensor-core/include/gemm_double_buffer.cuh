@@ -1,10 +1,5 @@
 #pragma once
-#include "cute/tensor.hpp"
-#include "cutlass/cutlass.h"
-#include "cutlass/layout/layout.h"
-#include <cutlass/array.h>
-#include <cutlass/cutlass.h>
-#include <cutlass/numeric_types.h>
+#include <cute/tensor.hpp>
 
 namespace gemm_double_buffer {
 
@@ -20,7 +15,7 @@ struct GemmConfig {
     
     using TiledMMA = decltype(make_tiled_mma(MMA_Atom{}, 
                       make_layout(Shape<_2, _2, _1>{}), 
-                      make_layout(Shape<_1, _2, _2>{})));
+                      make_layout(Shape<_1, _2, _1>{})));
 
     using SmemLayoutA = decltype(Layout<
         Shape <Int<kTileM>, Int<kTileK>, Int<kStage>>,
@@ -56,7 +51,7 @@ __global__ void gemm_kernel(void* Cptr, const void* Aptr, const void* Bptr, int 
     Tensor gC = local_tile(C, make_tile(Int<Config::kTileM>{}, Int<Config::kTileN>{}), make_coord(iy, ix));
 
     Tensor sA = make_tensor(make_smem_ptr(smem), typename Config::SmemLayoutA{});
-    Tensor sB = make_tensor(make_smem_ptr(smem + cosize(typename Config::SmemLayoutA{})), typename Config::SmemLayoutB{});
+    Tensor sB = make_tensor(make_smem_ptr(sA.data() + sA.size(), typename Config::SmemLayoutB{}));
 
     typename Config::TiledMMA tiled_mma;
     typename Config::GmemTiledCopy gmem_copy;
