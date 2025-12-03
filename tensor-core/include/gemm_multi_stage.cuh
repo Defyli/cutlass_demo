@@ -1,5 +1,10 @@
 #pragma once
-#include <cute/tensor.hpp>
+#include "cute/tensor.hpp"
+#include "cutlass/cutlass.h"
+#include "cutlass/layout/layout.h"
+#include <cutlass/array.h>
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
 
 namespace gemm_multi_stage {
 
