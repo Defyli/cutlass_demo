@@ -93,8 +93,8 @@ int main() {
     printf("cuBLAS: \t%.3f ms \t%.2f TFLOPS\n", ms_cublas, tflops / (ms_cublas * 1e-3));
 
     // 2. Run Simple
-    using ConfigSimple = gemm_simple::GemmConfig<T, 128, 128, 32>;
-    int smem_simple = sizeof(T) * (cute::cosize(typename ConfigSimple::SmemLayoutA{}) + cute::cosize(typename ConfigSimple::SmemLayoutB{}));
+    using ConfigSimple = gemm_simple::GemmConfig<T, 128, 128, 32, 128>;
+    int smem_simple = sizeof(T) * (cute::size(typename ConfigSimple::SmemLayoutA{}) + cute::size(typename ConfigSimple::SmemLayoutB{}));
     dim3 grid(N / 128, M / 128);
     dim3 block(128);
     
@@ -109,8 +109,8 @@ int main() {
     printf("Simple: \t%.3f ms \t%.2f TFLOPS\n", ms_simple, tflops / (ms_simple * 1e-3));
 
     // 3. Run Double Buffer
-    using ConfigDouble = gemm_double_buffer::GemmConfig<T, 128, 128, 32>;
-    int smem_double = sizeof(T) * (cute::cosize(typename ConfigDouble::SmemLayoutA{}) + cute::cosize(typename ConfigDouble::SmemLayoutB{}));
+    using ConfigDouble = gemm_double_buffer::GemmConfig<T, 128, 128, 32 128>;
+    int smem_double = sizeof(T) * (cute::size(typename ConfigDouble::SmemLayoutA{}) + cute::size(typename ConfigDouble::SmemLayoutB{}));
     
     CUDA_CHECK(cudaMemset(d_C, 0, bytes_C));
     gemm_double_buffer::gemm_kernel<ConfigDouble><<<grid, block, smem_double>>>(d_C, d_A, d_B, M, N, K);
@@ -122,8 +122,8 @@ int main() {
     printf("DoubleBuf: \t%.3f ms \t%.2f TFLOPS\n", ms_double, tflops / (ms_double * 1e-3));
 
     // 4. Run Multi Stage
-    using ConfigMulti = gemm_multi_stage::GemmConfig<T, 128, 128, 32, 3>; // 3 Stages
-    int smem_multi = sizeof(T) * (cute::cosize(typename ConfigMulti::SmemLayoutA{}) + cute::cosize(typename ConfigMulti::SmemLayoutB{}));
+    using ConfigMulti = gemm_multi_stage::GemmConfig<T, 128, 128, 32, 2, 128>; // 3 Stages
+    int smem_multi = sizeof(T) * (cute::size(typename ConfigMulti::SmemLayoutA{}) + cute::size(typename ConfigMulti::SmemLayoutB{}));
     
     // Set dynamic shared memory limit
     CUDA_CHECK(cudaFuncSetAttribute(gemm_multi_stage::gemm_kernel<ConfigMulti>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_multi));
