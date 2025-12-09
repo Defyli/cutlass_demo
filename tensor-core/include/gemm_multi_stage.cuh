@@ -28,7 +28,7 @@ struct GemmConfig {
     
     using TiledMMA = decltype(make_tiled_mma(MMA_Atom{}, 
                       make_layout(Shape<_2, _2, _1>{}), 
-                      make_layout(Shape<_1, _4, _1>{}))); // K-dim 2 for better interleaving
+                      Tile<Int<32>,Int<32>,Int<16>>{})); // K-dim 2 for better interleaving
 
     // Swizzle Layout for Shared Memory
     using SmemLayoutAtom = decltype(composition(
@@ -53,9 +53,9 @@ struct GemmConfig {
 
     // Ldmatrix Copy Atoms
     // A: Row-Major Smem -> Row-Major Reg (Normal)
-    using S2RCopyAtomA = Copy_Atom<SM75_U32x2_LDSM_N, T>;
+    using S2RCopyAtomA = Copy_Atom<SM75_U32x4_LDSM_N, T>;
     // B: Row-Major Smem -> Col-Major Reg (Normal, because Smem K is continuous)
-    using S2RCopyAtomB = Copy_Atom<SM75_U32x2_LDSM_N, T>;
+    using S2RCopyAtomB = Copy_Atom<SM75_U32x4_LDSM_N, T>;
 };
 
 template <typename Config>

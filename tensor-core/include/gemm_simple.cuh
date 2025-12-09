@@ -26,7 +26,7 @@ struct GemmConfig {
     
     using TiledMMA = decltype(make_tiled_mma(MMA_Atom{}, 
                       make_layout(Shape<_2, _2, _1>{}), 
-                      make_layout(Shape<_1, _2, _2>{})));
+                        Tile<Int<32>,Int<32>,Int<32>>{}));
 
     using SmemLayoutA = decltype(Layout<Shape<Int<kTileM>, Int<kTileK>>, Stride<Int<kTileK>, _1>>{});
     using SmemLayoutB = decltype(Layout<Shape<Int<kTileN>, Int<kTileK>>, Stride<Int<kTileK>, _1>>{});
