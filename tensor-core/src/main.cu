@@ -8,6 +8,7 @@
 #include "gemm_simple.cuh"
 #include "gemm_double_buffer.cuh"
 #include "gemm_multi_stage.cuh"
+#include "gemm_opt_final.cuh"
 
 using T = cute::half_t;
 
@@ -118,7 +119,7 @@ int main() {
     printf("DoubleBuf: \t%.3f ms \t%.2f TFLOPS\n", ms_double, tflops / (ms_double * 1e-3));
 
     // 4. Run Multi Stage
-    using ConfigMulti = gemm_multi_stage::GemmConfig<T, 128, 128, 32, 2, 128>; // 3 Stages
+    using ConfigMulti = gemm_multi_stage::GemmConfig<T, 128, 128, 32, 3, 128>; // 3 Stages
     int smem_multi = sizeof(T) * (cute::size(typename ConfigMulti::SmemLayoutA{}) + cute::size(typename ConfigMulti::SmemLayoutB{}));
     
     // Set dynamic shared memory limit
@@ -132,6 +133,23 @@ int main() {
         gemm_multi_stage::gemm_kernel<ConfigMulti><<<grid, block, smem_multi>>>(d_C, d_A, d_B, M, N, K); 
     }, 20);
     printf("MultiStage: \t%.3f ms \t%.2f TFLOPS\n", ms_multi, tflops / (ms_multi * 1e-3));
+
+    //5. Run Final Opt
+    using ConfigFinal = gemm_final_opt::GemmConfig<T, 128, 128, 32, 2, 128>;
+    int smem_final = sizeof(T) * (cute::size(typename ConfigMulti::SmemLayoutA{}) + cute::size(typename ConfigMulti::SmemLayoutB{}));
+
+    CUDA_CHECK(cudaFuncSetAttribute(gemm_final_opt::gemm_kernel<ConfigFinal>,cudaFuncAttributeMaxDynamicSharedMemorySize, smem_multi));
+
+    CUDA_CHECK(cudaMemset(d_C, 0, bytes_C));
+    gemm_final_opt::gemm_kernel<ConfigFinal><<<grid, block, smem_final>>>(d_C, d_A, d_B, M, N, K);
+    check_result(h_C_ref, d_C, M*N, "Final Opt");
+
+    float ms_final = benchmark([&](){
+        gemm_final_opt::gemm_kernel<ConfigFinal><<<grid, block, smem_final>>>(d_C, d_A, d_B, M, N, K);
+    }, 20);
+    printf("Final opt: \t%.3f ms \t%.2f TFLOPS\n", ms_final, tflops / (ms_final * 1e-3));
+
+
 
     // Cleanup
     free(h_A); free(h_B); free(h_C_ref);

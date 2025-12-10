@@ -6,7 +6,7 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
 
-namespace gemm_multi_stage {
+namespace gemm_final_opt {
 
 using namespace cute;
 
@@ -19,6 +19,7 @@ struct GemmConfig {
     static constexpr int NThreads = NThreads_;
     static_assert(kTileK%8==0);
     static constexpr int PerRowThreads = kTileK/8; // 4 * 8 = 32
+    static constexpr int PerRowThreadsWirte = kTileN/8; 
     static constexpr int kStage = KStage_;
 
     using ComputeType = T;
@@ -56,6 +57,30 @@ struct GemmConfig {
     using S2RCopyAtomA = Copy_Atom<SM75_U32x4_LDSM_N, T>;
     // B: Row-Major Smem -> Col-Major Reg (Normal, because Smem K is continuous)
     using S2RCopyAtomB = Copy_Atom<SM75_U32x4_LDSM_N, T>;
+
+    // C copy reg-->smem --> global mem
+    using SmemLayoutAtomC = decltype(composition(
+        Swizzle<3,3,3>{},
+        make_layout(Shape<Int<kTileM>,_8>{},
+                    Stride<_8,_1>{})
+    ));
+
+    using SmemLayoutC = decltype(tile_to_shape(
+            SmemLayoutAtomC{},
+            Shape<Int<kTileM>,Int<kTileN>>{}
+    ));
+
+    using CopyAtomC = Copy_Atom<UniversalCopy<cute::uint128_t>, T>;
+    using R2SCopyAtomC = Copy_Atom<UniversalCopy<T>, T>;
+
+    using GmemCopyC = decltype(make_tiled_copy(
+        CopyAtomC{},
+        Layout<Shape<Int<NThreads/PerRowThreadsWirte>,Int<PerRowThreadsWirte>>,Stride<Int<PerRowThreadsWirte>,_1> 
+        >{},
+        Layout<Shape<_1,_8>>{}
+    ));
+
+
 
 
 };
@@ -102,7 +127,7 @@ __global__ void gemm_kernel(void* Cptr, const void* Aptr, const void* Bptr, int 
     // S2R Views
     auto tXsA = thr_s2r_a.partition_S(sA);
     auto tXsB = thr_s2r_b.partition_S(sB);
-   
+
     // Registers
     auto tCrA = thr_mma.partition_fragment_A(sA(_,_,0));
     auto tCrB = thr_mma.partition_fragment_B(sB(_,_,0));
@@ -152,9 +177,7 @@ __global__ void gemm_kernel(void* Cptr, const void* Aptr, const void* Bptr, int 
     cp_async_wait<0>();
     __syncthreads();
 
-    // Epilogue (Drain pipeline)
     for(int i = 0; i < k_stage - 1; ++i) {
-
         copy(s2r_copy_a, tXsA(_,_,_,smem_read_stage), tCrA_view);
         copy(s2r_copy_b, tXsB(_,_,_,smem_read_stage), tCrB_view);
 
@@ -163,8 +186,27 @@ __global__ void gemm_kernel(void* Cptr, const void* Aptr, const void* Bptr, int 
         smem_read_stage = (smem_read_stage + 1) % k_stage;
     }
 
-    auto tCgC = thr_mma.partition_C(gC);
-    copy(tCrC, tCgC);
+    __syncthreads();
+
+    // reg --> smem
+    T* smem_C = smem;
+
+    Tensor sC = make_tensor(make_smem_ptr(smem_C), typename Config::SmemLayoutC{});
+    auto tCsC = thr_mma.partition_C(sC);
+
+    copy(tCrC, tCsC);
+
+    __syncthreads();
+
+    //smem -->  gloabl mem
+    typename Config::GmemCopyC gmemcopyC;
+    auto thr_copy_c = gmemcopyC.get_slice(threadIdx.x);
+
+    auto tCsC_gmem = thr_copy_c.partition_S(sC);
+    auto tCgC_gmem = thr_copy_c.partition_D(gC);
+
+    copy(gmemcopyC,tCsC_gmem,tCgC_gmem);
+
 }
 
 } // namespace gemm_multi_stage
