@@ -54,7 +54,7 @@ float benchmark(KernelFunc func, int n_iter) {
 int main() {
     int M = 4096;
     int N = 4096;
-    int K = 1024;
+    int K = 2048;
 
     printf("Benchmarking GEMM FP16: M=%d, N=%d, K=%d\n", M, N, K);
 
@@ -135,7 +135,7 @@ int main() {
     printf("MultiStage: \t%.3f ms \t%.2f TFLOPS\n", ms_multi, tflops / (ms_multi * 1e-3));
 
     //5. Run Final Opt
-    using ConfigFinal = gemm_final_opt::GemmConfig<T, 128, 128, 32, 2, 128>;
+    using ConfigFinal = gemm_final_opt::GemmConfig<T, 128, 128, 32, 3, 128>;
     int smem_final = sizeof(T) * (cute::size(typename ConfigMulti::SmemLayoutA{}) + cute::size(typename ConfigMulti::SmemLayoutB{}));
 
     CUDA_CHECK(cudaFuncSetAttribute(gemm_final_opt::gemm_kernel<ConfigFinal>,cudaFuncAttributeMaxDynamicSharedMemorySize, smem_multi));

@@ -61,8 +61,8 @@ struct GemmConfig {
     // C copy reg-->smem --> global mem
     using SmemLayoutAtomC = decltype(composition(
         Swizzle<3,3,3>{},
-        make_layout(Shape<Int<kTileM>,_8>{},
-                    Stride<_8,_1>{})
+        make_layout(Shape<Int<kTileM>,Int<kTileN>>{},
+                    Stride<Int<kTileN>,_1>{})
     ));
 
     using SmemLayoutC = decltype(tile_to_shape(
@@ -71,7 +71,7 @@ struct GemmConfig {
     ));
 
     using CopyAtomC = Copy_Atom<UniversalCopy<cute::uint128_t>, T>;
-    using R2SCopyAtomC = Copy_Atom<UniversalCopy<T>, T>;
+    using R2SCopyAtomC = Copy_Atom<UniversalCopy<int>, T>;
 
     using GmemCopyC = decltype(make_tiled_copy(
         CopyAtomC{},
@@ -152,6 +152,7 @@ __global__ void gemm_kernel(void* Cptr, const void* Aptr, const void* Bptr, int 
 
     int smem_write_stage = k_stage - 1;
     int smem_read_stage = 0;
+    
 
     // Main Loop
     for(int itile = 0; itile < num_tile_k - (k_stage - 1); ++itile) {
@@ -192,9 +193,17 @@ __global__ void gemm_kernel(void* Cptr, const void* Aptr, const void* Bptr, int 
     T* smem_C = smem;
 
     Tensor sC = make_tensor(make_smem_ptr(smem_C), typename Config::SmemLayoutC{});
-    auto tCsC = thr_mma.partition_C(sC);
+    auto r2s_tiled_copy_c = make_tiled_copy_C(typename Config::R2SCopyAtomC{}, tiled_mma);
+    auto r2s_thr_copy_c = r2s_tiled_copy_c.get_slice(threadIdx.x);
 
-    copy(tCrC, tCsC);
+    // retile_S: 将 MMA 累加器视图 (tCrC) 重排为拷贝视图
+    auto tCrC_r2s = r2s_thr_copy_c.retile_S(tCrC);
+    // partition_D: 将 Shared Memory (sC) 切分以匹配拷贝操作
+    auto tCsC_r2s = r2s_thr_copy_c.partition_D(sC);
+
+    // 执行拷贝：现在 CuTe 知道如何将寄存器中的数据搬运到 Smem 中了
+    copy(r2s_tiled_copy_c, tCrC_r2s, tCsC_r2s);
+
 
     __syncthreads();
 
