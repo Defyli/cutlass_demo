@@ -152,42 +152,50 @@ __global__ void gemm_kernel(void* Cptr, const void* Aptr, const void* Bptr, int 
 
     int smem_write_stage = k_stage - 1;
     int smem_read_stage = 0;
-    
+
+    int nk = size<2>(tCrA); 
+    cp_async_wait<Config::kStage - 2>();
+    __syncthreads();
+
+    // Prologue: 预加载第一个 K-slice 到寄存器
+    copy(s2r_copy_a, tXsA(_,_,0,smem_read_stage), tCrA_view(_,_,0));
+    copy(s2r_copy_b, tXsB(_,_,0,smem_read_stage), tCrB_view(_,_,0));
+
 
     // Main Loop
-    for(int itile = 0; itile < num_tile_k - (k_stage - 1); ++itile) {
-        cp_async_wait<Config::kStage - 2>();
-        __syncthreads();
+    for(int itile = 0; itile < num_tile_k; ++itile) {
+        for(int ik = 0; ik < nk; ++ik) {
+            int ik_next = (ik + 1) % nk;
+            
+            // 如果当前 Tile 的数据用完了 (ik 是最后一个 slice)，需要切换到下一个 Shared Memory Stage
+            if (ik == nk - 1) {
+                cp_async_wait<Config::kStage - 2>();
+                __syncthreads();
+                smem_read_stage = (smem_read_stage + 1) % k_stage;
+            }
 
-        // Load from Smem to Reg (ldmatrix)
-        copy(s2r_copy_a, tXsA(_,_,_,smem_read_stage), tCrA_view);
-        copy(s2r_copy_b, tXsB(_,_,_,smem_read_stage), tCrB_view);
+            // Pipeline: 加载下一个 K-slice 到寄存器 (覆盖旧数据)
+            // 关键点：我们在计算当前 slice (ik) 的同时，加载下一个 slice (ik_next)
+            // 如果 ik == nk-1，我们已经切换了 smem_read_stage，所以加载的是下一个 Tile 的第 0 个 slice
+            copy(s2r_copy_a, tXsA(_,_,ik_next,smem_read_stage), tCrA_view(_,_,ik_next));
+            copy(s2r_copy_b, tXsB(_,_,ik_next,smem_read_stage), tCrB_view(_,_,ik_next));
 
-        // Issue Next Global Load
-        copy(gmem_copy, tAgA(_,_,_,itile + k_stage - 1), tAsA(_,_,_,smem_write_stage));
-        copy(gmem_copy, tBgB(_,_,_,itile + k_stage - 1), tBsB(_,_,_,smem_write_stage));
-        cp_async_fence();
+            // 在每个 Tile 开始时 (ik==0)，发起下一轮的 Global -> Shared 预取
+            // 仅当还有剩余 Tile 需要加载时执行
+            if (ik == 0 && itile < num_tile_k - (k_stage - 1)) {
+                copy(gmem_copy, tAgA(_,_,_,itile + k_stage - 1), tAsA(_,_,_,smem_write_stage));
+                copy(gmem_copy, tBgB(_,_,_,itile + k_stage - 1), tBsB(_,_,_,smem_write_stage));
+                cp_async_fence();
+                smem_write_stage = (smem_write_stage + 1) % k_stage;
+            }
 
-        // Compute
-        gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC);
-
-        smem_write_stage = (smem_write_stage + 1) % k_stage;
-        smem_read_stage = (smem_read_stage + 1) % k_stage;
+            // 计算当前 K-slice (数据已经在 Prologue 或上一次循环中加载好了)
+            gemm(tiled_mma, tCrC, tCrA(_,_,ik), tCrB(_,_,ik), tCrC);
+        }
     }
 
-    cp_async_wait<0>();
     __syncthreads();
 
-    for(int i = 0; i < k_stage - 1; ++i) {
-        copy(s2r_copy_a, tXsA(_,_,_,smem_read_stage), tCrA_view);
-        copy(s2r_copy_b, tXsB(_,_,_,smem_read_stage), tCrB_view);
-
-        gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC);
-
-        smem_read_stage = (smem_read_stage + 1) % k_stage;
-    }
-
-    __syncthreads();
 
     // reg --> smem
     T* smem_C = smem;
