@@ -164,6 +164,7 @@ __global__ void gemm_kernel(void* Cptr, const void* Aptr, const void* Bptr, int 
 
     // Main Loop
     for(int itile = 0; itile < num_tile_k; ++itile) {
+        #pragma unroll
         for(int ik = 0; ik < nk; ++ik) {
             int ik_next = (ik + 1) % nk;
             
