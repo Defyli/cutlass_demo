@@ -9,6 +9,7 @@
 #include "gemm_double_buffer.cuh"
 #include "gemm_multi_stage.cuh"
 #include "gemm_opt_final.cuh"
+#include "gemm_boundary_check.cuh"
 
 using T = cute::half_t;
 
@@ -16,7 +17,6 @@ void run_cublas(cublasHandle_t handle, T* d_A, T* d_B, T* d_C, int M, int N, int
     half alpha = 1.0f;
     half beta = 0.0f;
     
-
     cublasStatus_t ret = cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
             N, M, K, 
             &alpha,
@@ -52,8 +52,9 @@ float benchmark(KernelFunc func, int n_iter) {
 }
 
 int main() {
-    int M = 4096;
-    int N = 4096;
+    // 你可以修改这里的 M, N, K 来测试非对齐的情况，例如 4097, 4099, 2050
+    int M = 5000;
+    int N = 5000;
     int K = 2048;
 
     printf("Benchmarking GEMM FP16: M=%d, N=%d, K=%d\n", M, N, K);
@@ -95,28 +96,35 @@ int main() {
     dim3 grid(N / 128, M / 128);
     dim3 block(128);
     
-    // Check correctness
-    CUDA_CHECK(cudaMemset(d_C, 0, bytes_C));
-    gemm_simple::gemm_kernel<ConfigSimple><<<grid, block, smem_simple>>>(d_C, d_A, d_B, M, N, K);
-    check_result(h_C_ref, d_C, M*N, "Simple");
+    if (M % 128 != 0 || N % 128 != 0 || K % 32 != 0) {
+        printf("Simple: \tSkipped (Dimensions not aligned with Tile size)\n");
+    } else {
+        CUDA_CHECK(cudaMemset(d_C, 0, bytes_C));
+        gemm_simple::gemm_kernel<ConfigSimple><<<grid, block, smem_simple>>>(d_C, d_A, d_B, M, N, K);
+        check_result(h_C_ref, d_C, M*N, "Simple");
 
-    float ms_simple = benchmark([&](){ 
-        gemm_simple::gemm_kernel<ConfigSimple><<<grid, block, smem_simple>>>(d_C, d_A, d_B, M, N, K); 
-    }, 20);
-    printf("Simple: \t%.3f ms \t%.2f TFLOPS\n", ms_simple, tflops / (ms_simple * 1e-3));
+        float ms_simple = benchmark([&](){ 
+            gemm_simple::gemm_kernel<ConfigSimple><<<grid, block, smem_simple>>>(d_C, d_A, d_B, M, N, K); 
+        }, 20);
+        printf("Simple: \t%.3f ms \t%.2f TFLOPS\n", ms_simple, tflops / (ms_simple * 1e-3));
+    }
 
     // 3. Run Double Buffer
     using ConfigDouble = gemm_double_buffer::GemmConfig<T, 128, 128, 32,128>;
     int smem_double = sizeof(T) * (cute::size(typename ConfigDouble::SmemLayoutA{}) + cute::size(typename ConfigDouble::SmemLayoutB{}));
     
-    CUDA_CHECK(cudaMemset(d_C, 0, bytes_C));
-    gemm_double_buffer::gemm_kernel<ConfigDouble><<<grid, block, smem_double>>>(d_C, d_A, d_B, M, N, K);
-    check_result(h_C_ref, d_C, M*N, "DoubleBuffer");
+    if (M % 128 != 0 || N % 128 != 0 || K % 32 != 0) {
+        printf("DoubleBuf: \tSkipped (Dimensions not aligned with Tile size)\n");
+    } else {
+        CUDA_CHECK(cudaMemset(d_C, 0, bytes_C));
+        gemm_double_buffer::gemm_kernel<ConfigDouble><<<grid, block, smem_double>>>(d_C, d_A, d_B, M, N, K);
+        check_result(h_C_ref, d_C, M*N, "DoubleBuffer");
 
-    float ms_double = benchmark([&](){ 
-        gemm_double_buffer::gemm_kernel<ConfigDouble><<<grid, block, smem_double>>>(d_C, d_A, d_B, M, N, K); 
-    }, 20);
-    printf("DoubleBuf: \t%.3f ms \t%.2f TFLOPS\n", ms_double, tflops / (ms_double * 1e-3));
+        float ms_double = benchmark([&](){ 
+            gemm_double_buffer::gemm_kernel<ConfigDouble><<<grid, block, smem_double>>>(d_C, d_A, d_B, M, N, K); 
+        }, 20);
+        printf("DoubleBuf: \t%.3f ms \t%.2f TFLOPS\n", ms_double, tflops / (ms_double * 1e-3));
+    }
 
     // 4. Run Multi Stage
     using ConfigMulti = gemm_multi_stage::GemmConfig<T, 128, 128, 32, 3, 128>; // 3 Stages
@@ -125,31 +133,55 @@ int main() {
     // Set dynamic shared memory limit
     CUDA_CHECK(cudaFuncSetAttribute(gemm_multi_stage::gemm_kernel<ConfigMulti>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_multi));
 
-    CUDA_CHECK(cudaMemset(d_C, 0, bytes_C));
-    gemm_multi_stage::gemm_kernel<ConfigMulti><<<grid, block, smem_multi>>>(d_C, d_A, d_B, M, N, K);
-    check_result(h_C_ref, d_C, M*N, "MultiStage");
+    if (M % 128 != 0 || N % 128 != 0 || K % 32 != 0) {
+        printf("MultiStage: \tSkipped (Dimensions not aligned with Tile size)\n");
+    } else {
+        CUDA_CHECK(cudaMemset(d_C, 0, bytes_C));
+        gemm_multi_stage::gemm_kernel<ConfigMulti><<<grid, block, smem_multi>>>(d_C, d_A, d_B, M, N, K);
+        check_result(h_C_ref, d_C, M*N, "MultiStage");
 
-    float ms_multi = benchmark([&](){ 
-        gemm_multi_stage::gemm_kernel<ConfigMulti><<<grid, block, smem_multi>>>(d_C, d_A, d_B, M, N, K); 
-    }, 20);
-    printf("MultiStage: \t%.3f ms \t%.2f TFLOPS\n", ms_multi, tflops / (ms_multi * 1e-3));
+        float ms_multi = benchmark([&](){ 
+            gemm_multi_stage::gemm_kernel<ConfigMulti><<<grid, block, smem_multi>>>(d_C, d_A, d_B, M, N, K); 
+        }, 20);
+        printf("MultiStage: \t%.3f ms \t%.2f TFLOPS\n", ms_multi, tflops / (ms_multi * 1e-3));
+    }
 
-    //5. Run Final Opt
+    // 5. Run Final Opt
     using ConfigFinal = gemm_final_opt::GemmConfig<T, 128, 128, 32, 3, 128>;
-    int smem_final = sizeof(T) * (cute::size(typename ConfigMulti::SmemLayoutA{}) + cute::size(typename ConfigMulti::SmemLayoutB{}));
+    int smem_final = sizeof(T) * (cute::size(typename ConfigFinal::SmemLayoutA{}) + cute::size(typename ConfigFinal::SmemLayoutB{}));
 
-    CUDA_CHECK(cudaFuncSetAttribute(gemm_final_opt::gemm_kernel<ConfigFinal>,cudaFuncAttributeMaxDynamicSharedMemorySize, smem_multi));
+    CUDA_CHECK(cudaFuncSetAttribute(gemm_final_opt::gemm_kernel<ConfigFinal>,cudaFuncAttributeMaxDynamicSharedMemorySize, smem_final));
+
+    if (M % 128 != 0 || N % 128 != 0 || K % 32 != 0) {
+        printf("Final opt: \tSkipped (Dimensions not aligned with Tile size)\n");
+    } else {
+        CUDA_CHECK(cudaMemset(d_C, 0, bytes_C));
+        gemm_final_opt::gemm_kernel<ConfigFinal><<<grid, block, smem_final>>>(d_C, d_A, d_B, M, N, K);
+        check_result(h_C_ref, d_C, M*N, "Final Opt");
+
+        float ms_final = benchmark([&](){
+            gemm_final_opt::gemm_kernel<ConfigFinal><<<grid, block, smem_final>>>(d_C, d_A, d_B, M, N, K);
+        }, 20);
+        printf("Final opt: \t%.3f ms \t%.2f TFLOPS\n", ms_final, tflops / (ms_final * 1e-3));
+    }
+
+    // 6. Run Boundary Check
+    using ConfigCheck = gemm_boundary_check::GemmConfig<T, 128, 128, 32, 3, 128>;
+    int smem_check = sizeof(T) * (cute::size(typename ConfigCheck::SmemLayoutA{}) + cute::size(typename ConfigCheck::SmemLayoutB{}));
+
+    CUDA_CHECK(cudaFuncSetAttribute(gemm_boundary_check::gemm_kernel<ConfigCheck>,cudaFuncAttributeMaxDynamicSharedMemorySize, smem_check));
+
+    // 对于 Boundary Check 版本，Grid 需要向上取整以覆盖边缘
+    dim3 grid_check((N + 128 - 1) / 128, (M + 128 - 1) / 128);
 
     CUDA_CHECK(cudaMemset(d_C, 0, bytes_C));
-    gemm_final_opt::gemm_kernel<ConfigFinal><<<grid, block, smem_final>>>(d_C, d_A, d_B, M, N, K);
-    check_result(h_C_ref, d_C, M*N, "Final Opt");
+    gemm_boundary_check::gemm_kernel<ConfigCheck><<<grid_check, block, smem_check>>>(d_C, d_A, d_B, M, N, K);
+    check_result(h_C_ref, d_C, M*N, "Boundary Check");
 
-    float ms_final = benchmark([&](){
-        gemm_final_opt::gemm_kernel<ConfigFinal><<<grid, block, smem_final>>>(d_C, d_A, d_B, M, N, K);
+    float ms_check = benchmark([&](){
+        gemm_boundary_check::gemm_kernel<ConfigCheck><<<grid_check, block, smem_check>>>(d_C, d_A, d_B, M, N, K);
     }, 20);
-    printf("Final opt: \t%.3f ms \t%.2f TFLOPS\n", ms_final, tflops / (ms_final * 1e-3));
-
-
+    printf("Boundary Check: \t%.3f ms \t%.2f TFLOPS\n", ms_check, tflops / (ms_check * 1e-3));
 
     // Cleanup
     free(h_A); free(h_B); free(h_C_ref);

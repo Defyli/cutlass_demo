@@ -25,7 +25,10 @@ void gen_rand_data(T *data, int n) {
 
 template <typename T>
 void check_result(const T* host_ref, const T* device_res, int N, const char* label) {
+
+    CUDA_CHECK(cudaDeviceSynchronize());
     T* host_res = (T*)malloc(N * sizeof(T));
+
     CUDA_CHECK(cudaMemcpy(host_res, device_res, N * sizeof(T), cudaMemcpyDeviceToHost));
 
     float max_diff = 0.0f;
