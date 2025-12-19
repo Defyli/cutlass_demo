@@ -80,9 +80,6 @@ struct GemmConfig {
         Layout<Shape<_1,_8>>{}
     ));
 
-
-
-
 };
 
 template <typename Config>

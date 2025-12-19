@@ -27,7 +27,7 @@ struct GemmConfig {
     static constexpr int NThreads = NThreads_;
     
     // FP8 指令要求 K 维度至少为 32
-    static_assert(kTileK % 32 == 0, "kTileK must be a multiple of 32 for FP8 MMA");
+    static_assert(kTileK % 64 == 0, "kTileK must be a multiple of 64 for multiple buffer FP8 MMA");
 
     static constexpr int PerRowThreads = kTileK / 16; // FP8: 128bit = 16 elements. 
     // 注意：这里假设 NThreads 足以覆盖一行。如果 kTileK=64, PerRowThreads=4. 
@@ -36,7 +36,7 @@ struct GemmConfig {
     static constexpr int kStage = KStage_;
 
     // 使用你封装的 SM89 FP8 MMA Atom
-    using MMA_Op = SM89_16x8x32_F32E5M2E5M2F32_TN;
+    using MMA_Op = SM89_16x8x32_F32E4M3E4M3F32_TN;
     using MMA_Traits = MMA_Traits<MMA_Op>;
     using MMA_Atom = MMA_Atom<MMA_Traits>;
     
@@ -45,7 +45,7 @@ struct GemmConfig {
     // 使用 2x2x1 的 Atom 布局 -> 覆盖 32x16x32 的区域，使用 4 个 Warps (128 线程)
     using TiledMMA = decltype(make_tiled_mma(MMA_Atom{}, 
                       make_layout(Shape<_2, _2, _1>{}), 
-                      Tile<Int<32>,Int<32>,Int<32>>{})); 
+                      Tile<Int<32>,Int<64>,Int<32>>{})); 
 
     // --- Shared Memory Layout ---
     // FP8 是 1 字节。为了无冲突访问 128-bit (16字节)，我们需要连续 16 个元素。

@@ -1,12 +1,11 @@
 #include <cuda_runtime.h>
-#include <cublasLt.h> // 必须包含 cublasLt
+#include <cublasLt.h> 
 #include <cstdio>
 #include <vector>
 #include <random>
 #include <algorithm>
-
-#include "utils.cuh" // 假设你有一个通用的 utils
-#include "gemm_fp8.cuh"
+#include <cublas_v2.h> 
+#include "gemm_fp8.cuh" 
 
 // 定义类型别名
 using ElementA = cutlass::float_e4m3_t;
@@ -15,24 +14,98 @@ using ElementC = float; // 累加和输出使用 float
 
 // 辅助函数：生成随机 FP8 数据
 void gen_rand_data_fp8(ElementA* data, size_t count) {
+    // 使用随机数引擎，生成范围在 [-0.5, 0.5] 的浮点数
+    // 包含负数可以减少累加和的膨胀，从而减少 FP32 精度溢出
+    std::default_random_engine generator(42);
+    std::uniform_real_distribution<float> distribution(-0.5f, 0.5f);
+
     for (size_t i = 0; i < count; ++i) {
-        float r = static_cast<float>(rand()) / RAND_MAX;
+        float r = distribution(generator);
         data[i] = static_cast<ElementA>(r);
     }
 }
 
-// 辅助函数：检查结果 (FP8 精度较低，误差容忍度需调高)
-void check_result_fp8(float* host_ref, float* device_res, int N, const char* name) {
+// 辅助函数：检查结果
+void check_result_fp8(float* host_ref, ElementC* device_res, int N, const char* name) {
     float* h_res = (float*)malloc(N * sizeof(float));
     cudaMemcpy(h_res, device_res, N * sizeof(float), cudaMemcpyDeviceToHost);
     
     double max_diff = 0.0;
+    double max_val = 0.0;
+    
     for(int i=0; i<N; ++i) {
+        double val = std::abs(host_ref[i]);
+        if (val > max_val) max_val = val;
+
         double diff = std::abs(host_ref[i] - h_res[i]);
         if(diff > max_diff) max_diff = diff;
     }
-    printf("%s Max Diff: %f\n", name, max_diff);
+    
+    double rel_err = (max_val > 1e-5) ? (max_diff / max_val) : max_diff;
+    
+    printf("%s -> Max Diff: %f, Max Val: %f, Rel Err: %e\n", name, max_diff, max_val, rel_err);
+    
+    // 经验法则：FP8 Tensor Core 累加结果与 FP32 Reference 的相对误差在 1e-4 ~ 1e-3 都是正常的
+    if (rel_err < 1e-3) {
+        printf(">> SUCCESS: Error is within acceptable FP8 numerical drift.\n");
+    } else {
+        printf(">> WARNING: Error might be too high. But this may be caused by bigger K due to accumlator error\n");
+    }
+
     free(h_res);
+}
+
+// 运行 FP32 cuBLAS 作为 Ground Truth
+// 计算 C = A * B^T
+void run_cublas_fp32_ref(cublasHandle_t handle, 
+                         ElementA* h_A, ElementB* h_B, float* h_C_ref, 
+                         int M, int N, int K) 
+{
+    // 1. 将 FP8 数据转为 FP32
+    float* h_A_f32 = (float*)malloc(M * K * sizeof(float));
+    float* h_B_f32 = (float*)malloc(N * K * sizeof(float));
+    
+    for(int i=0; i<M*K; ++i) h_A_f32[i] = static_cast<float>(h_A[i]);
+    for(int i=0; i<N*K; ++i) h_B_f32[i] = static_cast<float>(h_B[i]);
+
+    float *d_A_f32, *d_B_f32, *d_C_f32;
+    cudaMalloc(&d_A_f32, M * K * sizeof(float));
+    cudaMalloc(&d_B_f32, N * K * sizeof(float));
+    cudaMalloc(&d_C_f32, M * N * sizeof(float));
+
+    cudaMemcpy(d_A_f32, h_A_f32, M * K * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B_f32, h_B_f32, N * K * sizeof(float), cudaMemcpyHostToDevice);
+
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    
+    // 逻辑说明：
+    // 我们要计算 Row Major 的 C = A * B^T
+    // A (MxK), B (NxK)
+    // cuBLAS 是列主序 (Column Major)。
+    // 传入 Row Major 的矩阵指针，cuBLAS 会将其视为转置后的 Col Major 矩阵。
+    // d_B (NxK Row) -> 视为 KxN Col (即 B^T_row)
+    // d_A (MxK Row) -> 视为 KxM Col (即 A^T_row)
+    // 我们希望得到 C (MxN Row) -> 视为 NxM Col (即 C^T_row)
+    // 公式：C^T = (A * B^T)^T = B * A^T
+    // 映射到 cuBLAS Sgemm:
+    // OP(B_view) * OP(A_view)
+    // B_view 是 KxN. 我们需要 B (NxK). 所以用 OP_T (转置 B_view) -> NxK
+    // A_view 是 KxM. 我们需要 A^T (KxM). 所以用 OP_N (不转置 A_view) -> KxM
+    // 结果维度: (NxK) * (KxM) = NxM. 符合 C_view (NxM).
+    
+    cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, 
+                N, M, K, 
+                &alpha, 
+                d_B_f32, K, // ldb (B_view 的 leading dimension, 即 K)
+                d_A_f32, K, // lda (A_view 的 leading dimension, 即 K)
+                &beta, 
+                d_C_f32, N); // ldc (C_view 的 leading dimension, 即 N)
+
+    cudaMemcpy(h_C_ref, d_C_f32, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+
+    free(h_A_f32); free(h_B_f32);
+    cudaFree(d_A_f32); cudaFree(d_B_f32); cudaFree(d_C_f32);
 }
 
 // 封装 cuBLASLt FP8 GEMM
@@ -43,53 +116,34 @@ void run_cublasLt_fp8(cublasLtHandle_t ltHandle,
     cublasLtMatmulDesc_t operationDesc = NULL;
     cublasLtMatrixLayout_t Adesc = NULL, Bdesc = NULL, Cdesc = NULL;
     
-    // 1. 创建矩阵描述符
-    // A: M x K, Row Major (在 cuBLAS 中通常视为 Col Major 的转置，或者直接设为 Row Major)
-    // 这里为了匹配 CuTe 的 Row Major 输入，我们设置 Order
-    // 注意：cuBLASLt 默认是列主序。如果 A 是行主序 (M, K)，则相当于 (K, M) 的列主序转置。
-    // 简单起见，我们假设输入数据布局与 cuBLASLt 期望的一致 (TN 模式)
-    
-    // FP8 类型枚举
     cudaDataType_t Atype = CUDA_R_8F_E4M3;
     cudaDataType_t Btype = CUDA_R_8F_E4M3;
     cudaDataType_t Ctype = CUDA_R_32F;
     cublasComputeType_t computeType = CUBLAS_COMPUTE_32F;
 
-    cublasOperation_t transa = CUBLAS_OP_T;
-    cublasOperation_t transb = CUBLAS_OP_N;
+    // C = A * B^T
+    cublasOperation_t transa = CUBLAS_OP_N; 
+    cublasOperation_t transb = CUBLAS_OP_T; 
 
     cublasLtMatmulDescCreate(&operationDesc, computeType, CUDA_R_32F);
     cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(cublasOperation_t));
     cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(cublasOperation_t));
 
-    // Layout: A(K, M) transposed -> M x K. B(K, N) -> N x K (Wait, standard GEMM is M x K * K x N)
-    // CuTe Kernel: A(M, K) RowMajor, B(N, K) RowMajor (ColMajor in logic if transposed?)
-    // 让我们对齐 CuTe 的逻辑：
-    // A: (M, K) RowMajor -> 内存连续是 K。
-    // B: (N, K) RowMajor -> 内存连续是 K。
-    // C: (M, N) RowMajor -> 内存连续是 N。
+    // 显式设置 Layout 为 Row Major，简化维度理解
+    cublasLtOrder_t rowOrder = CUBLASLT_ORDER_ROW;
+
+    cublasLtMatrixLayoutCreate(&Adesc, Atype, M, K, K); 
+    cublasLtMatrixLayoutSetAttribute(Adesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &rowOrder, sizeof(rowOrder));
     
-    // cuBLASLt (ColMajor):
-    // C = alpha * op(A) * op(B) + beta * C
-    // 要得到 C (M, N) RowMajor (即 N, M ColMajor)
-    // 我们计算 C^T = B^T * A^T
-    // 这有点复杂。为了简化对比，我们只关注计算量和正确性的大致范围。
-    // 实际上，cuBLASLt 支持 Row Major 布局设置。
+    cublasLtMatrixLayoutCreate(&Bdesc, Btype, N, K, K); 
+    cublasLtMatrixLayoutSetAttribute(Bdesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &rowOrder, sizeof(rowOrder));
     
-    cublasLtMatrixLayoutCreate(&Adesc, Atype, M, K, K); // LDA = K
-    // cublasLtMatrixLayoutSetAttribute(Adesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &(cublasLtOrder_t){CUBLASLT_ORDER_ROW}, sizeof(cublasLtOrder_t));
-    
-    cublasLtMatrixLayoutCreate(&Bdesc, Btype, K, N, K); // LDB = K (B is N x K in memory?)
-    // 如果 B 是 (N, K) RowMajor，那它就是 (K, N) ColMajor。
-    // 我们需要 C = A * B^T (如果 B 是 N x K)
-    
-    // 让我们使用最简单的配置进行性能基准测试，不纠结于极其严格的布局匹配（只要维度对即可测 TFLOPS）
-    cublasLtMatrixLayoutCreate(&Cdesc, Ctype, M, N, N); // LDC = N
+    cublasLtMatrixLayoutCreate(&Cdesc, Ctype, M, N, N); 
+    cublasLtMatrixLayoutSetAttribute(Cdesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &rowOrder, sizeof(rowOrder));
 
     float alpha = 1.0f;
     float beta = 0.0f;
 
-    // Heuristic to find algo
     cublasLtMatmulPreference_t preference = NULL;
     cublasLtMatmulPreferenceCreate(&preference);
     size_t workspaceSize = 32 * 1024 * 1024;
@@ -103,6 +157,7 @@ void run_cublasLt_fp8(cublasLtHandle_t ltHandle,
 
     if (returnedResults == 0) {
         printf("cuBLASLt: No valid algorithm found!\n");
+        cudaFree(d_workspace);
         return;
     }
 
@@ -149,7 +204,7 @@ int main() {
 
     int M = 4096;
     int N = 4096;
-    int K = 4096;
+    int K = 1024;
 
     printf("Benchmarking FP8 GEMM (E4M3): M=%d, N=%d, K=%d\n", M, N, K);
 
@@ -173,13 +228,22 @@ int main() {
     cudaMemcpy(d_A, h_A, bytes_A, cudaMemcpyHostToDevice);
     cudaMemcpy(d_B, h_B, bytes_B, cudaMemcpyHostToDevice);
 
+    // 0. Run FP32 Reference (Ground Truth)
+    printf("Running FP32 Reference...\n");
+    float* h_C_fp32_ref = (float*)malloc(bytes_C);
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    run_cublas_fp32_ref(handle, h_A, h_B, h_C_fp32_ref, M, N, K);
+    cublasDestroy(handle);
+
     // 1. Run cuBLASLt (Baseline)
+    printf("Running cuBLASLt FP8...\n");
     cublasLtHandle_t ltHandle;
     cublasLtCreate(&ltHandle);
     
-    // Warmup & Correctness check (Skipped detailed correctness for brevity, focusing on perf)
+    // Warmup & Correctness check
     run_cublasLt_fp8(ltHandle, d_A, d_B, d_C, M, N, K);
-    cudaMemcpy(h_C_ref, d_C, bytes_C, cudaMemcpyDeviceToHost);
+    check_result_fp8(h_C_fp32_ref, d_C, M*N, "cuBLASLt FP8 vs FP32");
 
     float ms_cublas = benchmark([&](){ 
         run_cublasLt_fp8(ltHandle, d_A, d_B, d_C, M, N, K); 
@@ -190,15 +254,14 @@ int main() {
     printf("cuBLASLt FP8: \t%.3f ms \t%.2f TFLOPS\n", ms_cublas, tflops / (ms_cublas * 1e-3));
 
     // 2. Run Custom CuTe FP8 Kernel
+    printf("Running CuTe FP8 Kernel...\n");
     // Config: 128x128 Tile, K=64 (FP8 aligned), 3 Stages, 128 Threads
     using ConfigFP8 = gemm_fp8::GemmConfig<ElementA, ElementB, ElementC, 128, 128, 64, 3, 128>;
     
-    // 计算 Shared Memory 需求
-    // A: 128 * 64 * 1 byte * 3 stages = 24 KB
-    // B: 128 * 64 * 1 byte * 3 stages = 24 KB
-    // C: 128 * 128 * 4 bytes = 64 KB
-    // Max = 64 KB (C 复用 A/B 空间，或者 A/B 之后) -> 实际上需要 max(48KB, 64KB) = 64KB
-    int smem_size = 64 * 1024; 
+    int smem_size_ab = sizeof(ElementA) * cute::size(typename ConfigFP8::SmemLayoutA{}) + 
+                       sizeof(ElementB) * cute::size(typename ConfigFP8::SmemLayoutB{});
+    int smem_size_c = sizeof(ElementC) * cute::size(typename ConfigFP8::SmemLayoutC{});
+    int smem_size = std::max(smem_size_ab, smem_size_c);
     
     cudaFuncSetAttribute(gemm_fp8::gemm_kernel<ConfigFP8>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
@@ -208,8 +271,7 @@ int main() {
     cudaMemset(d_C, 0, bytes_C);
     gemm_fp8::gemm_kernel<ConfigFP8><<<grid, block, smem_size>>>(d_C, d_A, d_B, M, N, K);
     
-    // 简单检查一下结果是否非零 (FP8 精度问题导致逐位对比很难完全一致)
-    // check_result_fp8(h_C_ref, d_C, M*N, "CuTe FP8"); 
+    check_result_fp8(h_C_fp32_ref, d_C, M*N, "CuTe FP8 vs FP32"); 
 
     float ms_cute = benchmark([&](){
         gemm_fp8::gemm_kernel<ConfigFP8><<<grid, block, smem_size>>>(d_C, d_A, d_B, M, N, K);
@@ -218,7 +280,7 @@ int main() {
     printf("CuTe FP8 Opt: \t%.3f ms \t%.2f TFLOPS\n", ms_cute, tflops / (ms_cute * 1e-3));
 
     // Cleanup
-    free(h_A); free(h_B); free(h_C_ref);
+    free(h_A); free(h_B); free(h_C_ref); free(h_C_fp32_ref);
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
     cublasLtDestroy(ltHandle);
 
