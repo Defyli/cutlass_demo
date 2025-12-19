@@ -6,7 +6,7 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
 #include <cassert>
-namespace gemm_boundary_check {
+namespace gemm_double_boundary_check {
 
 using namespace cute;
 
