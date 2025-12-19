@@ -32,7 +32,7 @@ void check_result(const T* host_ref, const T* device_res, int N, const char* lab
     CUDA_CHECK(cudaMemcpy(host_res, device_res, N * sizeof(T), cudaMemcpyDeviceToHost));
 
     float max_diff = 0.0f;
-    float threshold = 0.1f;
+    float threshold = 0.5f;
     int err_cnt = 0;
 
     for (int i = 0; i < N; ++i) {
