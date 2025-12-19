@@ -24,7 +24,7 @@ include_directories(
 )
 
 # 源文件 (只编译 FP8 的 main)
-add_executable(gemm_fp8_demo ./main_fp8.cu)
+add_executable(gemm_fp8_demo ./main.cu)
 
 # 链接库
 # 注意：必须链接 cublasLt 才能运行 FP8 基准测试

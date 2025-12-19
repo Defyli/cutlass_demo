@@ -55,9 +55,12 @@ void run_cublasLt_fp8(cublasLtHandle_t ltHandle,
     cudaDataType_t Ctype = CUDA_R_32F;
     cublasComputeType_t computeType = CUBLAS_COMPUTE_32F;
 
+    cublasOperation_t transa = CUBLAS_OP_T;
+    cublasOperation_t transb = CUBLAS_OP_N;
+
     cublasLtMatmulDescCreate(&operationDesc, computeType, CUDA_R_32F);
-    cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &(cublasOperation_t){CUBLAS_OP_T}, sizeof(cublasOperation_t));
-    cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &(cublasOperation_t){CUBLAS_OP_N}, sizeof(cublasOperation_t));
+    cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(cublasOperation_t));
+    cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(cublasOperation_t));
 
     // Layout: A(K, M) transposed -> M x K. B(K, N) -> N x K (Wait, standard GEMM is M x K * K x N)
     // CuTe Kernel: A(M, K) RowMajor, B(N, K) RowMajor (ColMajor in logic if transposed?)
