@@ -121,8 +121,43 @@ __global__ void gemm_kernel(void* Cptr, const void* Aptr, const void* Bptr, int 
     Tensor B = make_tensor(make_gmem_ptr(reinterpret_cast<const TB*>(Bptr)), make_shape(n, k), make_stride(k, Int<1>{}));
     Tensor C = make_tensor(make_gmem_ptr(reinterpret_cast<TC*>(Cptr)), make_shape(m, n), make_stride(n, Int<1>{}));
 
-    int ix = blockIdx.x;
-    int iy = blockIdx.y;
+
+    // --- Thread Block Swizzle ---
+    // 目的：改变 Block 执行顺序以增加 L2 Cache 局部性
+    
+    // 1. 获取原始 Grid 维度
+    int n_tiles = gridDim.x;
+    int m_tiles = gridDim.y;
+    
+    // 2. 线性化 Block ID
+    int bid = blockIdx.x + blockIdx.y * gridDim.x;
+    
+    // 3. Swizzle 参数 (通常取 2, 4, 8)。
+    // 表示我们在 M 维度上一次性处理多少个 Tile (形成一个 Panel)
+    // 较大的 Swizzle 可以增加 B 矩阵的复用，但可能导致长尾效应。
+    constexpr int kSwizzle = 4; 
+
+    // 4. 重新计算 ix (N方向) 和 iy (M方向)
+    // 逻辑：将 Grid 视为高度为 kSwizzle 的水平条带。
+    // 在每个条带内部，优先沿 M 方向(垂直)走 kSwizzle 步，然后再沿 N 方向(水平)走。
+    
+    int idx_in_swizzle = bid % kSwizzle;      // 在 Panel 内的 M 偏移 (0 ~ kSwizzle-1)
+    int flat_swizzle_id = bid / kSwizzle;     // Panel 的线性索引
+    
+    int m_strip = flat_swizzle_id / n_tiles;  // 第几个水平条带
+    int n_idx = flat_swizzle_id % n_tiles;    // N 索引 (列)
+    
+    int m_idx = m_strip * kSwizzle + idx_in_swizzle; // 最终 M 索引
+    
+    // 边界检查：如果 GridY 不是 kSwizzle 的倍数，可能会算出越界的 m_idx
+    if (m_idx >= m_tiles) return;
+
+    int ix = n_idx;
+    int iy = m_idx;
+    // ----------------------------
+
+    // int ix = blockIdx.x;
+    // int iy = blockIdx.y;
 
     Tensor gA = local_tile(A, make_tile(Int<Config::kTileM>{}, Int<Config::kTileK>{}), make_coord(iy, _));
     Tensor gB = local_tile(B, make_tile(Int<Config::kTileN>{}, Int<Config::kTileK>{}), make_coord(ix, _));
