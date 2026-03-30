@@ -94,7 +94,6 @@ __global__ void gemm_kernel(void* Cptr, const void* Aptr, const void* Bptr, int 
     Tensor B = make_tensor(make_gmem_ptr(reinterpret_cast<const T*>(Bptr)), make_shape(n, k), make_stride(k, Int<1>{}));
     Tensor C = make_tensor(make_gmem_ptr(reinterpret_cast<T*>(Cptr)), make_shape(m, n), make_stride(n, Int<1>{}));
 
-
     // --- Thread Block Swizzle ---
     // 目的：改变 Block 执行顺序以增加 L2 Cache 局部性
     

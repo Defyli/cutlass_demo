@@ -1,0 +1,79 @@
+ptxas info    : 10 bytes gmem
+ptxas info    : Compiling entry function '_ZN9gemm_sm9020gemm_kernel_pingpongINS_10GemmConfigIN7cutlass10bfloat16_tELi128ELi128ELi64ELi3EEEN4cute9TiledCopyINS5_9Copy_AtomIJNS5_11Copy_TraitsINS5_13SM90_TMA_LOADEJNS5_1CILi131072EEENS5_12AuxTmaParamsINS5_5tupleIJNS5_11ScaledBasisINSA_ILi1EEEJLi1EEEENSE_ISF_JLi0EEEEEEERKNS5_6LayoutINSD_IJNSA_ILi64EEENSA_ILi128EEEEEESI_EERKNS5_7SwizzleILi3ELi4ELi3EEEEEEEES3_EEENSJ_INSD_IJSF_NSD_IJNSD_IJSM_SF_EEEEEEEEENSD_IJNSA_ILi0EEENSD_IJNSD_IJNSD_IJSL_SF_EEES10_EEEEEEEEEEENSD_IJSL_SK_EEEEES17_EEvPfT0_T1_iii' for 'sm_90a'
+ptxas info    : Function properties for _ZN9gemm_sm9020gemm_kernel_pingpongINS_10GemmConfigIN7cutlass10bfloat16_tELi128ELi128ELi64ELi3EEEN4cute9TiledCopyINS5_9Copy_AtomIJNS5_11Copy_TraitsINS5_13SM90_TMA_LOADEJNS5_1CILi131072EEENS5_12AuxTmaParamsINS5_5tupleIJNS5_11ScaledBasisINSA_ILi1EEEJLi1EEEENSE_ISF_JLi0EEEEEEERKNS5_6LayoutINSD_IJNSA_ILi64EEENSA_ILi128EEEEEESI_EERKNS5_7SwizzleILi3ELi4ELi3EEEEEEEES3_EEENSJ_INSD_IJSF_NSD_IJNSD_IJSM_SF_EEEEEEEEENSD_IJNSA_ILi0EEENSD_IJNSD_IJNSD_IJSL_SF_EEES10_EEEEEEEEEEENSD_IJSL_SK_EEEEES17_EEvPfT0_T1_iii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 232 registers, used 1 barriers
+ptxas info    : Compile time = 169.297 ms
+ptxas info    : Compiling entry function '_ZN9gemm_sm9020gemm_kernel_pingpongINS_10GemmConfigIN7cutlass10bfloat16_tELi128ELi128ELi64ELi4EEEN4cute9TiledCopyINS5_9Copy_AtomIJNS5_11Copy_TraitsINS5_13SM90_TMA_LOADEJNS5_1CILi131072EEENS5_12AuxTmaParamsINS5_5tupleIJNS5_11ScaledBasisINSA_ILi1EEEJLi1EEEENSE_ISF_JLi0EEEEEEERKNS5_6LayoutINSD_IJNSA_ILi64EEENSA_ILi128EEEEEESI_EERKNS5_7SwizzleILi3ELi4ELi3EEEEEEEES3_EEENSJ_INSD_IJSF_NSD_IJNSD_IJSM_SF_EEEEEEEEENSD_IJNSA_ILi0EEENSD_IJNSD_IJNSD_IJSL_SF_EEES10_EEEEEEEEEEENSD_IJSL_SK_EEEEES17_EEvPfT0_T1_iii' for 'sm_90a'
+ptxas info    : Function properties for _ZN9gemm_sm9020gemm_kernel_pingpongINS_10GemmConfigIN7cutlass10bfloat16_tELi128ELi128ELi64ELi4EEEN4cute9TiledCopyINS5_9Copy_AtomIJNS5_11Copy_TraitsINS5_13SM90_TMA_LOADEJNS5_1CILi131072EEENS5_12AuxTmaParamsINS5_5tupleIJNS5_11ScaledBasisINSA_ILi1EEEJLi1EEEENSE_ISF_JLi0EEEEEEERKNS5_6LayoutINSD_IJNSA_ILi64EEENSA_ILi128EEEEEESI_EERKNS5_7SwizzleILi3ELi4ELi3EEEEEEEES3_EEENSJ_INSD_IJSF_NSD_IJNSD_IJSM_SF_EEEEEEEEENSD_IJNSA_ILi0EEENSD_IJNSD_IJNSD_IJSL_SF_EEES10_EEEEEEEEEEENSD_IJSL_SK_EEEEES17_EEvPfT0_T1_iii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 232 registers, used 1 barriers
+ptxas info    : Compile time = 166.265 ms
+ptxas info    : Compiling entry function '_ZN9gemm_sm9020gemm_kernel_cp_asyncINS_10GemmConfigIN7cutlass10bfloat16_tELi128ELi128ELi64ELi3EEEEEvPfPKNT_1TES9_iii' for 'sm_90a'
+ptxas info    : Function properties for _ZN9gemm_sm9020gemm_kernel_cp_asyncINS_10GemmConfigIN7cutlass10bfloat16_tELi128ELi128ELi64ELi3EEEEEvPfPKNT_1TES9_iii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 198 registers, used 1 barriers
+ptxas info    : Compile time = 64.659 ms
+ptxas info    : Compiling entry function '_ZN9gemm_sm9015gemm_kernel_tmaINS_10GemmConfigIN7cutlass10bfloat16_tELi128ELi128ELi64ELi4EEEN4cute9TiledCopyINS5_9Copy_AtomIJNS5_11Copy_TraitsINS5_13SM90_TMA_LOADEJNS5_1CILi131072EEENS5_12AuxTmaParamsINS5_5tupleIJNS5_11ScaledBasisINSA_ILi1EEEJLi1EEEENSE_ISF_JLi0EEEEEEERKNS5_6LayoutINSD_IJNSA_ILi64EEENSA_ILi128EEEEEESI_EERKNS5_7SwizzleILi3ELi4ELi3EEEEEEEES3_EEENSJ_INSD_IJSF_NSD_IJNSD_IJSM_SF_EEEEEEEEENSD_IJNSA_ILi0EEENSD_IJNSD_IJNSD_IJSL_SF_EEES10_EEEEEEEEEEENSD_IJSL_SK_EEEEES17_EEvPfT0_T1_iii' for 'sm_90a'
+ptxas info    : Function properties for _ZN9gemm_sm9015gemm_kernel_tmaINS_10GemmConfigIN7cutlass10bfloat16_tELi128ELi128ELi64ELi4EEEN4cute9TiledCopyINS5_9Copy_AtomIJNS5_11Copy_TraitsINS5_13SM90_TMA_LOADEJNS5_1CILi131072EEENS5_12AuxTmaParamsINS5_5tupleIJNS5_11ScaledBasisINSA_ILi1EEEJLi1EEEENSE_ISF_JLi0EEEEEEERKNS5_6LayoutINSD_IJNSA_ILi64EEENSA_ILi128EEEEEESI_EERKNS5_7SwizzleILi3ELi4ELi3EEEEEEEES3_EEENSJ_INSD_IJSF_NSD_IJNSD_IJSM_SF_EEEEEEEEENSD_IJNSA_ILi0EEENSD_IJNSD_IJNSD_IJSL_SF_EEES10_EEEEEEEEEEENSD_IJSL_SK_EEEEES17_EEvPfT0_T1_iii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 154 registers, used 1 barriers
+ptxas info    : Compile time = 62.226 ms
+ptxas info    : Compiling entry function '_ZN9gemm_sm9015gemm_kernel_tmaINS_10GemmConfigIN7cutlass10bfloat16_tELi128ELi128ELi64ELi3EEEN4cute9TiledCopyINS5_9Copy_AtomIJNS5_11Copy_TraitsINS5_13SM90_TMA_LOADEJNS5_1CILi131072EEENS5_12AuxTmaParamsINS5_5tupleIJNS5_11ScaledBasisINSA_ILi1EEEJLi1EEEENSE_ISF_JLi0EEEEEEERKNS5_6LayoutINSD_IJNSA_ILi64EEENSA_ILi128EEEEEESI_EERKNS5_7SwizzleILi3ELi4ELi3EEEEEEEES3_EEENSJ_INSD_IJSF_NSD_IJNSD_IJSM_SF_EEEEEEEEENSD_IJNSA_ILi0EEENSD_IJNSD_IJNSD_IJSL_SF_EEES10_EEEEEEEEEEENSD_IJSL_SK_EEEEES17_EEvPfT0_T1_iii' for 'sm_90a'
+ptxas info    : Function properties for _ZN9gemm_sm9015gemm_kernel_tmaINS_10GemmConfigIN7cutlass10bfloat16_tELi128ELi128ELi64ELi3EEEN4cute9TiledCopyINS5_9Copy_AtomIJNS5_11Copy_TraitsINS5_13SM90_TMA_LOADEJNS5_1CILi131072EEENS5_12AuxTmaParamsINS5_5tupleIJNS5_11ScaledBasisINSA_ILi1EEEJLi1EEEENSE_ISF_JLi0EEEEEEERKNS5_6LayoutINSD_IJNSA_ILi64EEENSA_ILi128EEEEEESI_EERKNS5_7SwizzleILi3ELi4ELi3EEEEEEEES3_EEENSJ_INSD_IJSF_NSD_IJNSD_IJSM_SF_EEEEEEEEENSD_IJNSA_ILi0EEENSD_IJNSD_IJNSD_IJSL_SF_EEES10_EEEEEEEEEEENSD_IJSL_SK_EEEEES17_EEvPfT0_T1_iii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 154 registers, used 1 barriers
+ptxas info    : Compile time = 63.802 ms
+
+
+=== Running gemm_sm90_demo ===
+Device: NVIDIA H20-3e  SM 9.0
+GEMM: M=4096 N=4096 K=2048  (BF16 in, FP32 out)
+
+
+===============================================================
+  0. cuBLAS BF16 Baseline
+===============================================================
+cuBLAS BF16:    0.524 ms   131.05 TFLOPS
+
+===============================================================
+  1. CuTe SM90: TMA + GMMA
+===============================================================
+SMEM: A=49152B B=49152B mbar=24B total=98328B (96.0KB)
+Device max dynamic SMEM: 227KB
+[TMA+GMMA] PASSED  max_diff=0.0000e+00  max_ref=7.3730e-02  rel_err=0.00e+00
+SM90 TMA+GMMA:  0.519 ms   132.36 TFLOPS   (vs cuBLAS: 101.0%)
+
+===============================================================
+  1b. CuTe SM90: TMA + GMMA (kStage=4)
+===============================================================
+SMEM: 128.0KB
+[TMA+GMMA kStage=4] PASSED  max_diff=0.0000e+00  max_ref=7.3730e-02  rel_err=0.00e+00
+SM90 TMA+GMMA(k4): 0.588 ms   116.80 TFLOPS   (vs cuBLAS: 89.1%)
+
+===============================================================
+  2. CuTe SM90: cp.async + GMMA (无TMA, 对比版)
+===============================================================
+SMEM: 96.0 KB
+[cpasync+GMMA] PASSED  max_diff=0.0000e+00  max_ref=7.3730e-02  rel_err=0.00e+00
+SM90 cp.async+GMMA: 0.582 ms   118.12 TFLOPS   (vs cuBLAS: 90.1%)
+
+===============================================================
+  3. CuTe SM90: Ping-Pong (Producer WG + Consumer WG, kStage=4)
+===============================================================
+SMEM: A=65536B B=65536B mbar=64B total=131136B (128.1KB)
+[PingPong] PASSED  max_diff=0.0000e+00  max_ref=7.3730e-02  rel_err=0.00e+00
+SM90 PingPong:      0.591 ms   116.30 TFLOPS   (vs cuBLAS: 88.7%)
+
+===============================================================
+  3b. CuTe SM90: Ping-Pong kStage=3 (对照组, SMEM=96KB)
+===============================================================
+SMEM: A=49152B B=49152B mbar=48B total=98352B (96.0KB)
+[PingPong(k3)] PASSED  max_diff=0.0000e+00  max_ref=7.3730e-02  rel_err=0.00e+00
+SM90 PingPong(k3):  0.590 ms   116.41 TFLOPS   (vs cuBLAS: 88.8%)
+
+===============================================================
+  Performance Summary
+===============================================================
+  M=4096  N=4096  K=2048  (BF16 -> FP32)
+  Peak BF16 Tensor Core (theoretical): 79 TFLOPS
