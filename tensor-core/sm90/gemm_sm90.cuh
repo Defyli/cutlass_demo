@@ -29,3 +29,4 @@
 #include "detail/kernel_pingpong.cuh"
 #include "detail/kernel_pingpong_persistent.cuh"
 #include "detail/kernel_pingpong_cluster.cuh"
+#include "detail/kernel_2wg_tma_store.cuh"

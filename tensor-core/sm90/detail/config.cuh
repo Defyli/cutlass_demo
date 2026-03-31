@@ -130,7 +130,7 @@ struct GemmConfig {
 
     // 单 WarpGroup kernel: 128 线程
     static constexpr int kNumThreads   = 128;
-    // Ping-Pong kernel (v5): Consumer WG (128 线程) + Producer 1 warp (32 线程) = 160 线程
+    // Ping-Pong kernel (v5/v6): Consumer WG (128 线程) + Producer 1 warp (32 线程) = 160 线程
     //
     // 寄存器隔离设计 (v5 核心):
     //   v4 问题: Consumer(__forceinline__) + Producer(__forceinline__)
@@ -146,6 +146,26 @@ struct GemmConfig {
     //     SM 可驻留: floor(65536/24640) = 2 blocks ✅
     //     kStage=3: SMEM=96KB → floor(227/96) = 2 blocks → occupancy=2 ✅
     static constexpr int kNumThreadsPP = 160;
+
+    // 双 WG Cooperative kernel (v6/2WG): 2 Math WG + 1 Load WG = 384 线程
+    //
+    //   基于 hpc-ops 学习的两个新优化:
+    //   1. warpgroup_reg_alloc<168> / warpgroup_reg_dealloc<24>
+    //      Math WG: 增加到 168 reg (充分供 wgmma 累加器使用)
+    //      Load WG: 减少到 24 reg  (只做 TMA 控制, 不需要大量寄存器)
+    //
+    //   2. 每个 block 同时处理 2 个相邻 N tile:
+    //      WG0 → tile (by, bx*2),   WG1 → tile (by, bx*2+1)
+    //      grid.x = N/(kTileN*2)    (grid.x 减半, 每 block 处理 2 tiles)
+    //      sA 共享 (同一 M tile), sB0/sB1 分别对应两个 N tile
+    //      → 充分利用 2 Math WG 的并行计算能力
+    //
+    //   SMEM (kStage=2): A(32) + B0(32) + B1(32) + C0(32) + C1(32) ≈ 160KB ✓
+    //   TMA Store Epilogue: FP32→BF16 + STMATRIX + TMA Store (异步写回 GMEM)
+    //
+    //   __launch_bounds__(384, 1): 384 线程/block, 1 block/SM 目标
+    //   注意: 384×168 = 64512 ≈ 65536, SM 资源接近上限, occupancy≈1
+    static constexpr int kNumThreads2WG = 384;
 };
 
 // ============================================================================

@@ -45,6 +45,20 @@ using PingPongConfig3 = gemm_sm90::GemmConfig<T, 128, 128, 64, 3>;
 //   目的: 验证是否更高 occupancy 能带来更好性能
 using PingPongConfig2 = gemm_sm90::GemmConfig<T, 128, 128, 64, 2>;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 新增 kernel 的 Config (基于 hpc-ops 学习)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// 版本 A (v6): Ping-Pong + TMA Store Epilogue (160 线程, FP32 output)
+//   kStage=2: A(32) + B(32) + mbar + C_float(64) ≈ 128KB ✓
+//   (kStage=3 时: A(48)+B(48)+C_float(64) = 160KB > 128KB, 超限)
+using PPTmaStoreConfig = gemm_sm90::GemmConfig<T, 128, 128, 64, 2>;
+
+// 版本 B (2WG): 384 线程 双 WG Cooperative + FP32 直接写回
+//   kStage=2: A(32) + B0(32) + B1(32) + mbar ≈ 96KB ✓
+//   (FP32 输出直接 STG 写 GMEM, 无 C buffer)
+using Config2WG = gemm_sm90::GemmConfig<T, 128, 128, 64, 2>;
+
 // ============================================================================
 // CUDA / cuBLAS 错误检查宏
 // ============================================================================
@@ -101,7 +115,7 @@ void run_cublas_bf16(cublasHandle_t handle,
     ));
 }
 
-// 验证结果 (比对 device 结果与 host reference)
+// 验证结果 (比对 device 结果与 host reference, FP32)
 bool check_result(const AccumT* h_ref, AccumT* d_res, int N,
                   const char* label, float rel_threshold = 0.05f)
 {
@@ -199,14 +213,18 @@ int main(int argc, char* argv[]) {
 
     T      *d_A, *d_B;
     AccumT *d_C_cublas, *d_C_tma, *d_C_cpasync, *d_C_pingpong, *d_C_pingpong3;
+    // Section 4 (v6 TMA Store) 和 Section 5 (2WG) 的 FP32 输出 buffer
+    AccumT *d_C_v6, *d_C_2wg;
 
-    CUDA_CHECK(cudaMalloc(&d_A,          bytes_A));
-    CUDA_CHECK(cudaMalloc(&d_B,          bytes_B));
-    CUDA_CHECK(cudaMalloc(&d_C_cublas,   bytes_C));
-    CUDA_CHECK(cudaMalloc(&d_C_tma,      bytes_C));
-    CUDA_CHECK(cudaMalloc(&d_C_cpasync,  bytes_C));
-    CUDA_CHECK(cudaMalloc(&d_C_pingpong, bytes_C));
-    CUDA_CHECK(cudaMalloc(&d_C_pingpong3,bytes_C));
+    CUDA_CHECK(cudaMalloc(&d_A,           bytes_A));
+    CUDA_CHECK(cudaMalloc(&d_B,           bytes_B));
+    CUDA_CHECK(cudaMalloc(&d_C_cublas,    bytes_C));
+    CUDA_CHECK(cudaMalloc(&d_C_tma,       bytes_C));
+    CUDA_CHECK(cudaMalloc(&d_C_cpasync,   bytes_C));
+    CUDA_CHECK(cudaMalloc(&d_C_pingpong,  bytes_C));
+    CUDA_CHECK(cudaMalloc(&d_C_pingpong3, bytes_C));
+    CUDA_CHECK(cudaMalloc(&d_C_v6,        bytes_C));
+    CUDA_CHECK(cudaMalloc(&d_C_2wg,       bytes_C));
 
     CUDA_CHECK(cudaMemcpy(d_A, h_A.data(), bytes_A, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_B, h_B.data(), bytes_B, cudaMemcpyHostToDevice));
@@ -831,7 +849,163 @@ int main(int argc, char* argv[]) {
     }
 
     // =========================================================================
-    // 4. 性能汇总
+    // 4. CuTe SM90 Ping-Pong + TMA Store Epilogue (版本 A, 160 线程)
+    //
+    //   基于 hpc-ops 学习的 TMA Store 优化:
+    //   - Epilogue: FP32 累加器 → float SMEM → TMA Store (FP32)
+    //   - 输出类型: FP32
+    //   - TMA Store 是异步的, 不阻塞 Math WG
+    //   - SMEM (kStage=2): A(32) + B(32) + C_float(64) + mbar ≈ 128KB ✓
+    // =========================================================================
+    print_sep("4. CuTe SM90: PingPong v6 + TMA Store Epilogue (160 线程, FP32 out)");
+
+    {
+        using Cfg = PPTmaStoreConfig;
+
+        auto tensor_A_v6 = cute::make_tensor(
+            cute::make_gmem_ptr(d_A),
+            cute::make_shape(M, K), cute::make_stride(K, cute::_1{}));
+        auto tensor_B_v6 = cute::make_tensor(
+            cute::make_gmem_ptr(d_B),
+            cute::make_shape(N, K), cute::make_stride(K, cute::_1{}));
+        // TMA Store C (FP32 output, row-major): shape (M, N)
+        auto tensor_C_v6 = cute::make_tensor(
+            cute::make_gmem_ptr(d_C_v6),
+            cute::make_shape(M, N), cute::make_stride(N, cute::_1{}));
+
+        auto smem_layout_a_v6 = cute::tile_to_shape(
+            typename Cfg::SmemLayoutAtomA{},
+            cute::make_shape(cute::Int<Cfg::kTileM>{}, cute::Int<Cfg::kTileK>{}));
+        auto smem_layout_b_v6 = cute::tile_to_shape(
+            typename Cfg::SmemLayoutAtomB{},
+            cute::make_shape(cute::Int<Cfg::kTileN>{}, cute::Int<Cfg::kTileK>{}));
+        // C buffer SMEM layout for TMA Store: float row-major (M, N) stride (N, 1)
+        // TMA Store 不要求 swizzle, row-major 最简单
+        auto smem_layout_c_v6 = cute::make_layout(
+            cute::make_shape(cute::Int<Cfg::kTileM>{}, cute::Int<Cfg::kTileN>{}),
+            cute::make_stride(cute::Int<Cfg::kTileN>{}, cute::_1{}));
+
+        auto tma_a_v6 = cute::make_tma_copy(
+            cute::SM90_TMA_LOAD{}, tensor_A_v6, smem_layout_a_v6, cute::Int<1>{});
+        auto tma_b_v6 = cute::make_tma_copy(
+            cute::SM90_TMA_LOAD{}, tensor_B_v6, smem_layout_b_v6, cute::Int<1>{});
+        // TMA Store: float SMEM → float GMEM
+        auto tma_c_v6 = cute::make_tma_copy(
+            cute::SM90_TMA_STORE{}, tensor_C_v6, smem_layout_c_v6);
+
+        constexpr size_t smem_v6 = gemm_sm90::get_smem_size_pingpong_tma_store<Cfg>();
+        printf("SMEM: A=%zuKB B=%zuKB C_buf=%zuKB (float row-major) total=%.1fKB\n",
+               cute::cosize(typename Cfg::SmemLayoutA{}) * sizeof(T) / 1024,
+               cute::cosize(typename Cfg::SmemLayoutB{}) * sizeof(T) / 1024,
+               (size_t)Cfg::kTileM * Cfg::kTileN * sizeof(float) / 1024,
+               smem_v6 / 1024.0);
+
+        if (smem_v6 > prop.sharedMemPerBlockOptin) {
+            printf("SKIP: Required SMEM (%zu) > device max (%zu)\n",
+                   smem_v6, prop.sharedMemPerBlockOptin);
+        } else {
+            auto kernel_v6 = gemm_sm90::gemm_kernel_pingpong_tma_store<
+                Cfg, decltype(tma_a_v6), decltype(tma_b_v6), decltype(tma_c_v6)>;
+            CUDA_CHECK(cudaFuncSetAttribute(
+                kernel_v6, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_v6));
+
+            dim3 block_v6(Cfg::kNumThreadsPP);  // 160 线程
+            dim3 grid_v6(N / Cfg::kTileN, M / Cfg::kTileM);
+
+            // 正确性验证
+            CUDA_CHECK(cudaMemset(d_C_v6, 0, bytes_C));
+            kernel_v6<<<grid_v6, block_v6, smem_v6>>>(
+                tma_c_v6, tma_a_v6, tma_b_v6, M, N, K);
+            CUDA_CHECK(cudaGetLastError());
+            check_result(h_C_ref.data(), d_C_v6, M * N, "PP-TMAStore-v6");
+
+            // Performance
+            float ms_v6 = benchmark([&](){
+                kernel_v6<<<grid_v6, block_v6, smem_v6>>>(
+                    tma_c_v6, tma_a_v6, tma_b_v6, M, N, K);
+            });
+            printf("SM90 PP-TMAStore-v6: %.3f ms   %.2f TFLOPS   (vs cuBLAS: %.1f%%)\n",
+                   ms_v6, tflops(M, N, K, ms_v6), ms_cublas / ms_v6 * 100.f);
+        }
+    }
+
+    // =========================================================================
+    // 5. CuTe SM90 双 WG Cooperative GEMM (版本 B, 384 线程)
+    //
+    //   基于 hpc-ops 学习的双 WG 优化:
+    //   - 384 线程 = 2 Math WG (tid 0-255) + 1 Load WG (tid 256-383)
+    //   - 每个 block 同时处理 2 个相邻 N tile (grid.x 减半)
+    //   - warpgroup_reg_alloc<168> (Math WG) + warpgroup_reg_dealloc<24> (Load WG)
+    //   - Epilogue: FP32 直接 STG 写回 GMEM (无 SMEM C buffer)
+    //   - SMEM (kStage=2): A(32) + B0(32) + B1(32) + mbar ≈ 96KB ✓
+    // =========================================================================
+    print_sep("5. CuTe SM90: 双WG Cooperative (384 线程, FP32 out)");
+
+    {
+        using Cfg = Config2WG;
+
+        auto tensor_A_2wg = cute::make_tensor(
+            cute::make_gmem_ptr(d_A),
+            cute::make_shape(M, K), cute::make_stride(K, cute::_1{}));
+        auto tensor_B_2wg = cute::make_tensor(
+            cute::make_gmem_ptr(d_B),
+            cute::make_shape(N, K), cute::make_stride(K, cute::_1{}));
+
+        auto smem_layout_a_2wg = cute::tile_to_shape(
+            typename Cfg::SmemLayoutAtomA{},
+            cute::make_shape(cute::Int<Cfg::kTileM>{}, cute::Int<Cfg::kTileK>{}));
+        auto smem_layout_b_2wg = cute::tile_to_shape(
+            typename Cfg::SmemLayoutAtomB{},
+            cute::make_shape(cute::Int<Cfg::kTileN>{}, cute::Int<Cfg::kTileK>{}));
+
+        auto tma_a_2wg = cute::make_tma_copy(
+            cute::SM90_TMA_LOAD{}, tensor_A_2wg, smem_layout_a_2wg, cute::Int<1>{});
+        auto tma_b_2wg = cute::make_tma_copy(
+            cute::SM90_TMA_LOAD{}, tensor_B_2wg, smem_layout_b_2wg, cute::Int<1>{});
+
+        constexpr size_t smem_2wg = gemm_sm90::get_smem_size_2wg_pingpong<Cfg>();
+        printf("SMEM: A=%zuKB B0=%zuKB B1=%zuKB mbar total=%.1fKB\n",
+               cute::cosize(typename Cfg::SmemLayoutA{}) * sizeof(T) / 1024,
+               cute::cosize(typename Cfg::SmemLayoutB{}) * sizeof(T) / 1024,
+               cute::cosize(typename Cfg::SmemLayoutB{}) * sizeof(T) / 1024,
+               smem_2wg / 1024.0);
+
+        // 检查 N 是否能被 kTileN*2 整除 (版本 B 要求 grid.x = N/(kTileN*2))
+        if (N % (Cfg::kTileN * 2) != 0) {
+            printf("SKIP: N=%d not divisible by kTileN*2=%d\n",
+                   N, Cfg::kTileN * 2);
+        } else if (smem_2wg > prop.sharedMemPerBlockOptin) {
+            printf("SKIP: Required SMEM (%zu) > device max (%zu)\n",
+                   smem_2wg, prop.sharedMemPerBlockOptin);
+        } else {
+            auto kernel_2wg = gemm_sm90::gemm_kernel_2wg_pingpong<
+                Cfg, decltype(tma_a_2wg), decltype(tma_b_2wg)>;
+            CUDA_CHECK(cudaFuncSetAttribute(
+                kernel_2wg, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_2wg));
+
+            dim3 block_2wg(Cfg::kNumThreads2WG);  // 384 线程
+            // grid.x 减半: 每 block 处理 2 个 N tile
+            dim3 grid_2wg(N / (Cfg::kTileN * 2), M / Cfg::kTileM);
+
+            // 正确性验证
+            CUDA_CHECK(cudaMemset(d_C_2wg, 0, bytes_C));
+            kernel_2wg<<<grid_2wg, block_2wg, smem_2wg>>>(
+                d_C_2wg, tma_a_2wg, tma_b_2wg, M, N, K);
+            CUDA_CHECK(cudaGetLastError());
+            check_result(h_C_ref.data(), d_C_2wg, M * N, "2WG-Coop");
+
+            // Performance
+            float ms_2wg = benchmark([&](){
+                kernel_2wg<<<grid_2wg, block_2wg, smem_2wg>>>(
+                    d_C_2wg, tma_a_2wg, tma_b_2wg, M, N, K);
+            });
+            printf("SM90 2WG-Coop:       %.3f ms   %.2f TFLOPS   (vs cuBLAS: %.1f%%)\n",
+                   ms_2wg, tflops(M, N, K, ms_2wg), ms_cublas / ms_2wg * 100.f);
+        }
+    }
+
+    // =========================================================================
+    // 6. 性能汇总
     // =========================================================================
     print_sep("Performance Summary");
     printf("  M=%d  N=%d  K=%d  (BF16 -> FP32)\n", M, N, K);
@@ -848,6 +1022,8 @@ int main(int argc, char* argv[]) {
     CUDA_CHECK(cudaFree(d_C_cpasync));
     CUDA_CHECK(cudaFree(d_C_pingpong));
     CUDA_CHECK(cudaFree(d_C_pingpong3));
+    CUDA_CHECK(cudaFree(d_C_v6));
+    CUDA_CHECK(cudaFree(d_C_2wg));
     CUBLAS_CHECK(cublasDestroy(handle));
 
     return 0;
