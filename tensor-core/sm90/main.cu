@@ -39,6 +39,12 @@ using PingPongConfig = gemm_sm90::GemmConfig<T, 128, 128, 64, 4>;
 //   SMEM: (128*64*3 + 128*64*3) * 2B + 2*3*8B = 98304 + 48 = 96KB
 using PingPongConfig3 = gemm_sm90::GemmConfig<T, 128, 128, 64, 3>;
 
+// Ping-Pong kStage=2 极限测试: 最小 SMEM(64KB), 理论 occupancy=3
+//   SMEM: (128*64*2 + 128*64*2) * 2B + 2*2*8B = 65536 + 32 = 64KB
+//   Occupancy: floor(227/64) = 3 blocks/SM ← 比 kStage=3 的 2 blocks 更高!
+//   目的: 验证是否更高 occupancy 能带来更好性能
+using PingPongConfig2 = gemm_sm90::GemmConfig<T, 128, 128, 64, 2>;
+
 // ============================================================================
 // CUDA / cuBLAS 错误检查宏
 // ============================================================================
@@ -456,7 +462,7 @@ int main(int argc, char* argv[]) {
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 smem_pp));
 
-            dim3 block_pp(Cfg::kNumThreadsPP);  // 256 线程
+            dim3 block_pp(Cfg::kNumThreadsPP);  // 160 线程 (128 Consumer + 32 Producer)
             dim3 grid_pp(N / Cfg::kTileN, M / Cfg::kTileM);
 
             CUDA_CHECK(cudaMemset(d_C_pingpong, 0, bytes_C));
@@ -529,7 +535,7 @@ int main(int argc, char* argv[]) {
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 smem_pp3));
 
-            dim3 block_pp3(Cfg::kNumThreadsPP);  // 256 线程
+            dim3 block_pp3(Cfg::kNumThreadsPP);  // 160 线程 (128 Consumer + 32 Producer)
             dim3 grid_pp3(N / Cfg::kTileN, M / Cfg::kTileM);
 
             CUDA_CHECK(cudaMemset(d_C_pingpong3, 0, bytes_C));
@@ -544,6 +550,283 @@ int main(int argc, char* argv[]) {
             });
             printf("SM90 PingPong(k3):  %.3f ms   %.2f TFLOPS   (vs cuBLAS: %.1f%%)\n",
                    ms3, tflops(M, N, K, ms3), ms_cublas / ms3 * 100.f);
+        }
+    }
+
+    // =========================================================================
+    // 3c. CuTe SM90 Ping-Pong kStage=2 (极限 SMEM=64KB, 理论 occupancy=3)
+    //
+    //   目的: 验证更高 occupancy 是否能带来更好性能
+    //     SMEM=64KB → floor(227/64) = 3 blocks/SM (vs kStage=3 的 2 blocks)
+    //     但 kStage=2 的流水线更短，可能增加 TMA 延迟暴露
+    // =========================================================================
+    print_sep("3c. CuTe SM90: Ping-Pong kStage=2 (SMEM=64KB, occupancy=3?)");
+
+    {
+        using Cfg = PingPongConfig2;
+
+        auto tensor_A_pp2 = cute::make_tensor(
+            cute::make_gmem_ptr(d_A),
+            cute::make_shape(M, K),
+            cute::make_stride(K, cute::_1{})
+        );
+        auto tensor_B_pp2 = cute::make_tensor(
+            cute::make_gmem_ptr(d_B),
+            cute::make_shape(N, K),
+            cute::make_stride(K, cute::_1{})
+        );
+        auto smem_layout_a_pp2 = cute::tile_to_shape(
+            typename Cfg::SmemLayoutAtomA{},
+            cute::make_shape(cute::Int<Cfg::kTileM>{}, cute::Int<Cfg::kTileK>{})
+        );
+        auto smem_layout_b_pp2 = cute::tile_to_shape(
+            typename Cfg::SmemLayoutAtomB{},
+            cute::make_shape(cute::Int<Cfg::kTileN>{}, cute::Int<Cfg::kTileK>{})
+        );
+        auto tma_a_pp2 = cute::make_tma_copy(
+            cute::SM90_TMA_LOAD{}, tensor_A_pp2, smem_layout_a_pp2, cute::Int<1>{}
+        );
+        auto tma_b_pp2 = cute::make_tma_copy(
+            cute::SM90_TMA_LOAD{}, tensor_B_pp2, smem_layout_b_pp2, cute::Int<1>{}
+        );
+
+        constexpr size_t smem_pp2 = gemm_sm90::get_smem_size_pingpong<Cfg>();
+        printf("SMEM: A=%zuB B=%zuB mbar=%zuB total=%zuB (%.1fKB)\n",
+               cute::cosize(typename Cfg::SmemLayoutA{}) * sizeof(T),
+               cute::cosize(typename Cfg::SmemLayoutB{}) * sizeof(T),
+               2 * (size_t)Cfg::kStage * sizeof(uint64_t),
+               smem_pp2, smem_pp2 / 1024.0);
+
+        if (smem_pp2 > prop.sharedMemPerBlockOptin) {
+            printf("SKIP: Required SMEM (%zu) > device max (%zu)\n",
+                   smem_pp2, prop.sharedMemPerBlockOptin);
+        } else {
+            auto kernel_pp2 = gemm_sm90::gemm_kernel_pingpong<
+                Cfg, decltype(tma_a_pp2), decltype(tma_b_pp2)>;
+            CUDA_CHECK(cudaFuncSetAttribute(
+                kernel_pp2,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                smem_pp2));
+
+            dim3 block_pp2(Cfg::kNumThreadsPP);
+            dim3 grid_pp2(N / Cfg::kTileN, M / Cfg::kTileM);
+
+            CUDA_CHECK(cudaMemset(d_C_pingpong3, 0, bytes_C));  // 复用 d_C_pingpong3
+            kernel_pp2<<<grid_pp2, block_pp2, smem_pp2>>>(
+                d_C_pingpong3, tma_a_pp2, tma_b_pp2, M, N, K);
+            CUDA_CHECK(cudaGetLastError());
+            check_result(h_C_ref.data(), d_C_pingpong3, M * N, "PingPong(k2)");
+
+            float ms2 = benchmark([&](){
+                kernel_pp2<<<grid_pp2, block_pp2, smem_pp2>>>(
+                    d_C_pingpong3, tma_a_pp2, tma_b_pp2, M, N, K);
+            });
+            printf("SM90 PingPong(k2):  %.3f ms   %.2f TFLOPS   (vs cuBLAS: %.1f%%)\n",
+                   ms2, tflops(M, N, K, ms2), ms_cublas / ms2 * 100.f);
+        }
+    }
+
+    // =========================================================================
+    // 3d. CuTe SM90 Ping-Pong Persistent (kStage=3, 动态 tile 调度)
+    //
+    //   目的: 消除 wave 切换开销 (1024 tiles / 156 active blocks ≈ 6.6 waves)
+    //     通过 atomicAdd 动态分配 tiles, 实现 work stealing
+    //     Grid = num_sm × occupancy = 78 × 2 = 156 blocks (填满所有 SM)
+    //     对比 v5 (1024 blocks), 减少 kernel launch 次数和调度开销
+    // =========================================================================
+    print_sep("3d. CuTe SM90: PingPong Persistent (kStage=3, 156 blocks)");
+
+    {
+        using Cfg = PingPongConfig3;  // kStage=3, 128x128x64
+
+        auto tensor_A_pers = cute::make_tensor(
+            cute::make_gmem_ptr(d_A),
+            cute::make_shape(M, K),
+            cute::make_stride(K, cute::_1{})
+        );
+        auto tensor_B_pers = cute::make_tensor(
+            cute::make_gmem_ptr(d_B),
+            cute::make_shape(N, K),
+            cute::make_stride(K, cute::_1{})
+        );
+        auto smem_layout_a_pers = cute::tile_to_shape(
+            typename Cfg::SmemLayoutAtomA{},
+            cute::make_shape(cute::Int<Cfg::kTileM>{}, cute::Int<Cfg::kTileK>{})
+        );
+        auto smem_layout_b_pers = cute::tile_to_shape(
+            typename Cfg::SmemLayoutAtomB{},
+            cute::make_shape(cute::Int<Cfg::kTileN>{}, cute::Int<Cfg::kTileK>{})
+        );
+        auto tma_a_pers = cute::make_tma_copy(
+            cute::SM90_TMA_LOAD{}, tensor_A_pers, smem_layout_a_pers, cute::Int<1>{}
+        );
+        auto tma_b_pers = cute::make_tma_copy(
+            cute::SM90_TMA_LOAD{}, tensor_B_pers, smem_layout_b_pers, cute::Int<1>{}
+        );
+
+        constexpr size_t smem_pers = gemm_sm90::get_smem_size_pingpong_persistent<Cfg>();
+        printf("SMEM: %.1fKB, grid: %d blocks (num_sm=%d × occ=2)\n",
+               smem_pers / 1024.0, prop.multiProcessorCount * 2, prop.multiProcessorCount);
+
+        if (smem_pers > prop.sharedMemPerBlockOptin) {
+            printf("SKIP: Required SMEM (%zu) > device max (%zu)\n",
+                   smem_pers, prop.sharedMemPerBlockOptin);
+        } else {
+            auto kernel_pers = gemm_sm90::gemm_kernel_pingpong_persistent<
+                Cfg, decltype(tma_a_pers), decltype(tma_b_pers)>;
+            CUDA_CHECK(cudaFuncSetAttribute(
+                kernel_pers,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                smem_pers));
+
+            // tile counter: 全局原子计数器
+            int* d_tile_counter = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_tile_counter, sizeof(int)));
+
+            int num_tiles_n = N / Cfg::kTileN;
+            int num_tiles_m = M / Cfg::kTileM;
+            int num_persistent = prop.multiProcessorCount * 2;  // 78×2=156
+
+            dim3 block_pers(Cfg::kNumThreadsPP);
+            dim3 grid_pers(num_persistent);
+
+            // 正确性验证
+            CUDA_CHECK(cudaMemset(d_C_pingpong3, 0, bytes_C));
+            CUDA_CHECK(cudaMemset(d_tile_counter, 0, sizeof(int)));
+            kernel_pers<<<grid_pers, block_pers, smem_pers>>>(
+                d_C_pingpong3, d_tile_counter,
+                tma_a_pers, tma_b_pers,
+                M, N, K, num_tiles_n, num_tiles_m);
+            CUDA_CHECK(cudaGetLastError());
+            check_result(h_C_ref.data(), d_C_pingpong3, M * N, "PingPong-Persistent");
+
+            // Benchmark
+            float ms_pers = benchmark([&](){
+                CUDA_CHECK(cudaMemset(d_tile_counter, 0, sizeof(int)));
+                kernel_pers<<<grid_pers, block_pers, smem_pers>>>(
+                    d_C_pingpong3, d_tile_counter,
+                    tma_a_pers, tma_b_pers,
+                    M, N, K, num_tiles_n, num_tiles_m);
+            });
+            printf("SM90 PingPong-Pers: %.3f ms   %.2f TFLOPS   (vs cuBLAS: %.1f%%)\n",
+                   ms_pers, tflops(M, N, K, ms_pers), ms_cublas / ms_pers * 100.f);
+
+            CUDA_CHECK(cudaFree(d_tile_counter));
+        }
+    }
+
+    // =========================================================================
+    // 3e. CuTe SM90 Ping-Pong Cluster (kStage=3, Cluster=1x2 TMA-A Multicast)
+    //
+    //   目的: 减少 A 的 TMA 带宽开销
+    //     cluster_size=2 (N 方向): 两个 CTA 共享同一 M tile 的 A 数据
+    //     TMA multicast: 每个 CTA 只加载 A 的 1/2, 通过 multicast 让另一个 CTA 也得到该部分
+    //     TMA A 并发度翻倍, 减少 A 的 HBM 读取 50% (原理上)
+    //
+    //   __cluster_dims__(2, 1, 1): X 方向 cluster_size=2 (N 方向 2 个 CTA)
+    //   grid.x = N/kTileN (实际 block 数量, 需要是 2 的倍数)
+    //   grid.y = M/kTileM
+    // =========================================================================
+    print_sep("3e. CuTe SM90: PingPong Cluster (Cluster=1x2, TMA-A Multicast)");
+
+    {
+        using Cfg = PingPongConfig3;  // kStage=3, 128x128x64
+
+        auto tensor_A_cl = cute::make_tensor(
+            cute::make_gmem_ptr(d_A),
+            cute::make_shape(M, K),
+            cute::make_stride(K, cute::_1{})
+        );
+        auto tensor_B_cl = cute::make_tensor(
+            cute::make_gmem_ptr(d_B),
+            cute::make_shape(N, K),
+            cute::make_stride(K, cute::_1{})
+        );
+
+        // smem layout for A (一个 CTA 的完整 A tile)
+        auto smem_layout_a_cl = cute::tile_to_shape(
+            typename Cfg::SmemLayoutAtomA{},
+            cute::make_shape(cute::Int<Cfg::kTileM>{}, cute::Int<Cfg::kTileK>{})
+        );
+        // smem layout for B (普通, 一个 CTA 的 B tile)
+        auto smem_layout_b_cl = cute::tile_to_shape(
+            typename Cfg::SmemLayoutAtomB{},
+            cute::make_shape(cute::Int<Cfg::kTileN>{}, cute::Int<Cfg::kTileK>{})
+        );
+
+        // TMA A: SM90_TMA_LOAD_MULTICAST, cluster_size=2
+        //   第四个参数 cute::Int<2>{} 表示 cluster_size=2
+        //   这会将 TMA box 的 M 维度缩小为 kTileM/2, 每个 CTA 只加载 A 的一半
+        //   multicast_mask 在 kernel 内指定 (=0b11 for cluster_size=2)
+        auto tma_a_cl = cute::make_tma_copy(
+            cute::SM90_TMA_LOAD_MULTICAST{},
+            tensor_A_cl,
+            smem_layout_a_cl,
+            cute::Int<2>{}   // cluster_size (multicast 的 CTA 数量)
+        );
+        // TMA B: 普通 SM90_TMA_LOAD
+        auto tma_b_cl = cute::make_tma_copy(
+            cute::SM90_TMA_LOAD{},
+            tensor_B_cl,
+            smem_layout_b_cl,
+            cute::Int<1>{}
+        );
+
+        constexpr size_t smem_cl = gemm_sm90::get_smem_size_pingpong_cluster<Cfg>();
+        printf("SMEM: %.1fKB, cluster_dims=(2,1,1), grid=(%d,%d)\n",
+               smem_cl / 1024.0, N / Cfg::kTileN, M / Cfg::kTileM);
+
+        if (smem_cl > prop.sharedMemPerBlockOptin) {
+            printf("SKIP: Required SMEM (%zu) > device max (%zu)\n",
+                   smem_cl, prop.sharedMemPerBlockOptin);
+        } else {
+            auto kernel_cl = gemm_sm90::gemm_kernel_pingpong_cluster<
+                Cfg, decltype(tma_a_cl), decltype(tma_b_cl)>;
+            CUDA_CHECK(cudaFuncSetAttribute(
+                kernel_cl,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                smem_cl));
+
+            dim3 block_cl(Cfg::kNumThreadsPP);
+            // grid.x = N/kTileN (必须是 cluster_size=2 的倍数)
+            // grid.y = M/kTileM
+            int gx = N / Cfg::kTileN;
+            int gy = M / Cfg::kTileM;
+            dim3 grid_cl(gx, gy);
+
+            // 使用 cudaLaunchKernelExArgs 指定 cluster 形状
+            // (或直接用 __cluster_dims__ 编译时指定)
+            cudaLaunchConfig_t launch_config = {};
+            launch_config.gridDim  = grid_cl;
+            launch_config.blockDim = block_cl;
+            launch_config.dynamicSmemBytes = smem_cl;
+            launch_config.stream   = nullptr;
+
+            cudaLaunchAttribute attr[1];
+            attr[0].id = cudaLaunchAttributeClusterDimension;
+            attr[0].val.clusterDim = {2, 1, 1};
+            launch_config.numAttrs = 1;
+            launch_config.attrs    = attr;
+
+            // 使用 cudaLaunchKernelEx 直接传参 (模板版本)
+            auto launch_cluster = [&](float* Cptr) {
+                return cudaLaunchKernelEx(&launch_config,
+                                          kernel_cl,
+                                          Cptr, tma_a_cl, tma_b_cl, M, N, K);
+            };
+
+            // 正确性验证
+            CUDA_CHECK(cudaMemset(d_C_pingpong3, 0, bytes_C));
+            CUDA_CHECK(launch_cluster(d_C_pingpong3));
+            CUDA_CHECK(cudaGetLastError());
+            check_result(h_C_ref.data(), d_C_pingpong3, M * N, "PingPong-Cluster");
+
+            // Benchmark
+            float ms_cl = benchmark([&](){
+                CUDA_CHECK(launch_cluster(d_C_pingpong3));
+            });
+            printf("SM90 PingPong-Cluster: %.3f ms   %.2f TFLOPS   (vs cuBLAS: %.1f%%)\n",
+                   ms_cl, tflops(M, N, K, ms_cl), ms_cublas / ms_cl * 100.f);
         }
     }
 

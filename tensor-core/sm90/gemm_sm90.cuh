@@ -27,3 +27,5 @@
 #include "detail/kernel_tma.cuh"
 #include "detail/kernel_cp_async.cuh"
 #include "detail/kernel_pingpong.cuh"
+#include "detail/kernel_pingpong_persistent.cuh"
+#include "detail/kernel_pingpong_cluster.cuh"

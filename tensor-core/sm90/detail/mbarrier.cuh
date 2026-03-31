@@ -72,4 +72,51 @@ CUTE_DEVICE void mbar_arrive(uint64_t* mbar) {
                  :: "r"(smem_ptr));
 }
 
+// Predicated arrive: 等价于 if (pred) mbar_arrive(mbar)
+// 用 PTX @pred 指令实现, 避免 C/C++ if-else 在 wgmma 上下文中产生 divergent path
+// (C7520 warning: wgmma serialized due to compiler-inserted WG.AR in divergent path)
+CUTE_DEVICE void mbar_arrive_if(uint64_t* mbar, bool pred) {
+    uint32_t smem_ptr = cute::cast_smem_ptr_to_uint(mbar);
+    asm volatile(
+        "{\n"
+        ".reg .pred p;\n"
+        "setp.ne.u32 p, %1, 0;\n"
+        "@p mbarrier.arrive.shared::cta.b64 _, [%0];\n"
+        "}\n"
+        :: "r"(smem_ptr), "r"((uint32_t)pred));
+}
+
+// ============================================================================
+// Cluster-scope mbarrier 操作 (用于 Cluster TMA Multicast)
+// ============================================================================
+
+// arrive + 预告 TMA 字节数 (远端 CTA, cluster 作用域)
+//
+// 使用 shared::cluster 地址空间, 通过 mapa 指令将本 CTA 的 smem 地址映射到远端 CTA
+// 用于 Cluster TMA Multicast 场景: leader CTA (如 cta_rank=0) 负责 arrive 所有 CTA 的 mbar
+// 
+// cta_id: cluster 内的目标 CTA ID (0, 1, ... cluster_size-1)
+// pred:   是否执行该 arrive (1=执行, 0=跳过)
+//
+// 典型用法:
+//   if (prod_tid == 0 && cta_rank == 0) {  // leader producer thread
+//     mbar_arrive_and_expect_tx(mbar_full[s], tx_bytes);          // local CTA
+//     mbar_arrive_and_expect_tx_remote(mbar_full[s], tx_bytes, 1, 1); // remote CTA1
+//   }
+CUTE_DEVICE void mbar_arrive_and_expect_tx_remote(
+    uint64_t* mbar, int tx_bytes, int cta_id, int pred = 1)
+{
+    uint32_t smem_ptr = cute::cast_smem_ptr_to_uint(mbar);
+    asm volatile(
+        "{\n"
+        ".reg .pred p;\n"
+        ".reg .b32 remAddr32;\n"
+        "setp.eq.u32 p, %2, 1;\n"
+        "@p mapa.shared::cluster.u32  remAddr32, %0, %1;\n"
+        "@p mbarrier.arrive.expect_tx.shared::cluster.b64  _, [remAddr32], %3;\n"
+        "}\n"
+        :: "r"(smem_ptr), "r"(cta_id), "r"(pred), "r"(tx_bytes)
+        : "memory");
+}
+
 } // namespace gemm_sm90

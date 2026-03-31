@@ -7,3 +7,6 @@
 
 /ptx-isa-markdown
 /.claude
+/hpc-ops
+
+*.txt

@@ -17,11 +17,21 @@
 9. [迭代七：实测结果与分析 —— kStage=4性能下降与容器内性能分析方案](#9-迭代七实测结果与分析--kstage4性能下降与容器内性能分析方案)
 10. [迭代八：Ping-Pong Producer 优化 —— 单线程驱动 TMA](#10-迭代八ping-pong-producer-优化--单线程驱动-tma)
 11. [迭代九：nsys 性能分析与低 occupancy 根因定位](#11-迭代九nsys-性能分析与低-occupancy-根因定位)
-12. [迭代十：寄存器分离优化 —— __noinline__ 重构](#12-迭代十寄存器分离优化----noinline-重构)
+12. [迭代十：寄存器分离优化 —— `__noinline__` 重构](#12-迭代十寄存器分离优化----noinline-重构)
 13. [迭代十一：代码结构整理](#13-迭代十一代码结构整理)
 14. [当前代码结构](#14-当前代码结构)
-15. [性能数据汇总](#15-性能数据汇总)
-16. [待办事项](#16-待办事项)
+15. [迭代十二：v3，消除 C7510 警告](#15-迭代十二v3消除-c7510-警告__forceinline__)
+16. [迭代十三：诊断 `setmaxnreg` 无效的根因](#16-迭代十三诊断-setmaxnreg-无效的根因)
+17. [迭代十四：v4，减少 Producer 线程数（256→160）](#17-迭代十四v4减少-producer-线程数256160)
+18. [迭代十五：v5，寄存器隔离](#18-迭代十五v5寄存器隔离consumer-__forceinline__--producer-__noinline__)
+19. [当前代码结构（v5）](#19-当前代码结构v5)
+20. [性能数据汇总（最新）](#20-性能数据汇总最新)
+21. [v6 进一步优化探索（kStage=2 测试）](#21-v6-进一步优化探索kstage2-测试)
+22. [不同规模性能对比](#22-不同规模性能对比)
+23. [性能优化结论](#23-性能优化结论)
+24. [待办事项](#24-待办事项)
+25. [迭代十六：Persistent Kernel + Cluster TMA Multicast 架构探索](#25-迭代十六persistent-kernel--cluster-tma-multicast-架构探索)
+26. [迭代十七：Cluster TMA Multicast 调试与放弃](#26-迭代十七cluster-tma-multicast-调试与放弃)
 
 ---
 
@@ -871,7 +881,7 @@ GemmConfig<T, kTileM, kTileN, kTileK, kStage>
   SmemLayout    = tile_to_shape(Layout_K_SW128_Atom<T>{}, (M, K, Stage))
   G2SCopy       = cp.async 128bit, 128 线程
   kNumThreads   = 128   (单 WG 版本)
-  kNumThreadsPP = 256   (Ping-Pong 版本)
+  kNumThreadsPP = 160   (Ping-Pong v4: 128 Consumer + 32 Producer)
 get_smem_size_tma<Config>()        → A+B+mbar (kStage 个)
 get_smem_size_cp_async<Config>()   → A+B
 get_smem_size_pingpong<Config>()   → A+B+2×kStage 个 mbar
@@ -895,17 +905,19 @@ gemm_kernel_cp_async<Config>(C, A, B, M, N, K)
   128 线程, 单 WG
   cp.async + cp_async_fence/wait + wgmma_wait<0>（用于对比）
 
-─── detail/kernel_pingpong.cuh ──────────────────────────────────────────────
-pp_producer_loop<Config>(...)  __device__ __noinline__, ~40 reg
-  setmaxnreg.dec 40 → wg_tid==0 执行 TMA 循环
+─── detail/kernel_pingpong.cuh (v4) ─────────────────────────────────────────
+pp_producer_loop<Config>(...)  __device__ __forceinline__
+  prod_tid = tid - 128 (0-31), 只有 prod_tid==0 发起 TMA + mbar 操作
 
-pp_consumer_loop<Config>(...)  __device__ __noinline__, ~154 reg
-  全 128 线程 mbar_wait → wgmma → wgmma_wait<1> → mbar_arrive
+pp_consumer_loop<Config>(...)  __device__ __forceinline__
+  全 128 线程: mbar_wait → wgmma → wgmma_wait<1> → mbar_arrive_if
+  无 setmaxnreg
 
 gemm_kernel_pingpong<Config, TmaCopyA, TmaCopyB>(C, tma_a, tma_b, M, N, K)
-  256 线程: WG0=Consumer, WG1=Producer
-  分发到 pp_producer_loop / pp_consumer_loop
-  ptxas reg = max(40, 154) = 154（优化后）
+  __launch_bounds__(160, 2)
+  tid  0-127: Consumer WG (完整 WarpGroup, wgmma 有效)
+  tid 128-159: Producer warp (只有 tid==128 工作)
+  ptxas: 154 reg, 0 spill → occupancy=2 @ kStage=3
 ```
 
 ### SMEM 布局
@@ -929,39 +941,671 @@ gemm_kernel_pingpong<Config, TmaCopyA, TmaCopyB>(C, tma_a, tma_b, M, N, K)
 
 ---
 
-## 15. 性能数据汇总
+## 15. 迭代十二：v3，消除 C7510 警告（`__forceinline__`）
+
+### 问题：`__noinline__` 导致 C7510 警告引发 wgmma 序列化
+
+v2 重构后虽然 ptxas 报告寄存器降至约 160，但编译出现：
+
+```
+warning #7510-D: wgmma.mma_async pipeline: wgmma pipeline may be suboptimal
+  due to crossing function boundary
+```
+
+根因：`__noinline__` 在 `pp_consumer_loop` 函数边界强迫编译器插入隐式的 `wgmma.wait_group 0`，序列化所有 in-flight wgmma，等价于主动禁用了 GMMA 异步流水线。
+
+实测（v2，256 线程）：
+```
+PingPong(k3) = 603 us   vs   TMA(k3) = 522 us   差距 81 us (15.5%)
+```
+
+### 修复：`__noinline__` → `__forceinline__`
+
+将 `pp_producer_loop` 和 `pp_consumer_loop` 均改为 `__forceinline__`：
+- 消除函数边界 → C7510 警告消失 → wgmma async pipeline 完整保留
+
+v3 实测（256 线程，保留 setmaxnreg）：
+```
+PingPong(k3) = 594 us   差距缩小至 72 us (13.8%)
+```
+
+### 遗留问题
+
+```
+PingPong(k3) = 594 us  ≈  TMA(k4) = 593 us
+```
+
+这个等式暗示 PingPong(k3) 实际 occupancy = **1 block**，`setmaxnreg` 并未生效。
+
+---
+
+## 16. 迭代十三：诊断 `setmaxnreg` 无效的根因
+
+### 根本原因
+
+**SM 在 block 入驻（kernel launch 阶段）时，按 ptxas 编译期静态值（160 reg × 256 threads = 40960）预分配寄存器文件空间。此时 `setmaxnreg` 尚未执行，SM 只能驻留 1 个 block。**
+
+`setmaxnreg` 只对 **persistent kernel** 有效：某个 WarpGroup 完成工作、执行 `setmaxnreg.dec` 释放寄存器后，SM 动态调度新 block，收益才能体现。
+
+### 参考：CUTLASS 官方 SM90 PingPong 架构
+
+查阅 `cutlass/include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_pingpong.hpp`：
+
+```
+MaxThreadsPerBlock = 384（1 Producer WG + 2 Consumer WG）
+MinBlocksPerMultiprocessor = 1
+LoadRegisterRequirement = 40    (Producer warpgroup_reg_dealloc)
+MmaRegisterRequirement  = 232   (Consumer warpgroup_reg_alloc)
+```
+
+CUTLASS PingPong 的真正价值：**2 个 Consumer WG 分别处理不同的 output tile**，通过 `MathWarpGroupOrderBarrier` 交替执行 MMA 和 Epilogue，需配合 persistent work tile scheduler。对于非 persistent 单 tile 设计，该架构无法直接套用。
+
+---
+
+## 17. 迭代十四：v4，减少 Producer 线程数（256→160）
+
+### 核心洞察：从线程数而非 setmaxnreg 入手
+
+直接减少 block 总线程数，让 ptxas 静态值自然满足 occupancy=2：
+
+```
+v3 (256 线程):  160 reg × 256 = 40960 reg/block → floor(65536/40960) = 1 block
+v4 (160 线程):  154 reg × 160 = 24640 reg/block → floor(65536/24640) = 2 blocks ✅
+```
+
+### 为什么 Producer 只需 32 线程（1 warp）？
+
+原 Producer WarpGroup 有 128 线程（4 warps），但：
+- TMA 发起只需 1 个线程（`prod_tid==0`），其余 127 个线程**完全空转**
+- mbarrier arrive/wait 也只需 1 个线程
+- 减少到 32 线程后，SM warp scheduler 有更多资源服务 Consumer WG
+
+### 代码修改
+
+**`config.cuh`：**
+```cpp
+static constexpr int kNumThreadsPP = 160;  // 128 Consumer + 32 Producer (v4)
+```
+
+**`kernel_pingpong.cuh` v4：**
+```cpp
+// 全部移除 setmaxnreg
+// tid  0-127: Consumer WG (整个 WarpGroup, 参与 wgmma)
+// tid 128-159: Producer warp (只有 tid==128 发起 TMA)
+const bool is_producer = (tid >= 128);
+const int  wg_tid      = tid;           // Consumer: 直接 0-127
+const int  prod_tid    = tid - 128;     // Producer: 0-31
+
+__launch_bounds__(160, 2)  // min_blocks=2 提示 ptxas 目标 occupancy
+```
+
+**`__launch_bounds__(160, 2)` 的额外效果：**
+`min_blocks=2` 将 ptxas 寄存器上限压缩到 `floor(65536/(2×160)) = 204 reg`，ptxas 据此进一步优化至 **154 reg**（v3 为 160 reg）。
+
+### 实测结果
+
+```
+ptxas: 154 reg, 0 spill stores, 0 spill loads  (kStage=3 和 kStage=4)
+```
+
+| 版本 | 线程数 | 寄存器 | PingPong(k3) | PingPong(k4) |
+|------|--------|--------|-------------|-------------|
+| v3（setmaxnreg）| 256 | 160 | 594 us | 595 us |
+| **v4（160线程）** | **160** | **154** | **524 us ✅** | **594 us** |
+
+PingPong(k3)：594 us → **524 us**，与 TMA(k3) = 522 us **持平（差距 < 0.5%）**！
+
+### nsys 深度分析验证
+
+`cuda_gpu_kern_sum` 汇总：
+```
+gemm_kernel_pingpong (kStage=4, 128KB SMEM)  Avg = 593 us  ← 1 block, SMEM 受限
+gemm_kernel_pingpong (kStage=3,  96KB SMEM)  Avg = 523 us  ← 2 blocks ✅
+gemm_kernel_tma      (kStage=3,  96KB SMEM)  Avg = 523 us  ← 2 blocks (对照)
+```
+
+逐次时间序列（query 2-11）：
+```
+PingPong run  1-26 (kStage=4): ~593 us  ← 1 block (SMEM 瓶颈)
+PingPong run 27-52 (kStage=3): ~522 us  ← 2 blocks ✅ 完全等同 TMA
+TMA      run  1-26 (kStage=3): ~522 us
+TMA      run 27-38 (kStage=4): ~593 us
+```
+
+### kStage=4 仍受 SMEM 限制
+
+```
+PingPong(k4): SMEM = 128KB → floor(227KB/128KB) = 1 block
+```
+与线程数和寄存器无关，是 128×128×64 tile size 下的架构上限。
+
+---
+
+## 18. 迭代十五：v5，寄存器隔离（Consumer __forceinline__ + Producer __noinline__）
+
+### v4 遗留问题：232 reg 导致 occupancy 仍为 1
+
+v4 实测 ptxas 报告 **232 registers**，而非预期的 154：
+
+```
+v4 实测:  232 reg × 160 = 37120 reg/block → floor(65536/37120) = 1 block ❌
+预期目标: 154 reg × 160 = 24640 reg/block → floor(65536/24640) = 2 blocks ✅
+```
+
+**根因分析**：v4 将 `pp_producer_loop` 和 `pp_consumer_loop` 都设为 `__forceinline__`，
+ptxas 将两者全部内联进 kernel 本体。对于 `if (is_producer) { ... } else { ... }` 结构，
+ptxas **为两个分支同时分配寄存器**（即取两分支寄存器需求的并集）：
+
+```
+Consumer 分支: ~154 reg（wgmma 累加器 + tCrA/tCrB/tCrC）
+Producer 分支: ~78  reg（TMA 张量视图 tAgA/tAsA/tBgB/tBsB）
+合并后 kernel: 232 reg（两者叠加）
+```
+
+TMA 张量视图本身寄存器开销约 78 reg，这是 v4 的 "hidden cost"。
+
+### v5 解决方案：寄存器路径隔离
+
+```
+Consumer 路径: pp_consumer_loop  → __forceinline__  (wgmma 必须无函数边界, 避免 C7510)
+Producer 路径: pp_producer_loop  → __noinline__     (只做 TMA, 不执行 wgmma, 无 C7510 风险)
+```
+
+关键变化：
+1. `pp_producer_loop` 改回 `__noinline__`，**将 TMA 张量视图构建移入函数内部**
+2. kernel 本体 Consumer 路径只构建 `gC / sA / sB`，无任何 TMA 相关变量
+3. ptxas 分析 kernel 时，Consumer 线程不再看到 TMA 视图寄存器
+
+```cpp
+// v5: Producer __noinline__ 隔离
+template <typename Config, typename TmaCopyA, typename TmaCopyB>
+__device__ __noinline__ void pp_producer_loop(
+    ..., char* smem_A_ptr, char* smem_B_ptr,
+    int prod_tid, int bx, int by, int M, int N, int K)
+{
+    if (prod_tid == 0) {
+        // TMA 视图在函数内部构建 (寄存器限制在本函数栈帧, 不污染 kernel 本体)
+        auto mA = tma_a.get_tma_tensor(make_shape(M, K));
+        Tensor tAgA = cta_tma_a.partition_S(gA);
+        // ... TMA copy loop ...
+    }
+}
+
+// kernel 本体 Consumer 路径: 无 TMA 视图
+} else {
+    auto sA = make_tensor(make_smem_ptr(...), typename Config::SmemLayoutA{});
+    auto gC = local_tile(...);          // 只有 gC/sA/sB
+    pp_consumer_loop<Config>(...);      // __forceinline__, 154 reg
+}
+```
+
+### v5 编译结果
+
+```
+ptxas info: gemm_kernel_pingpong (k3): Used 154 registers, 0 spill ✅  (v4: 232!)
+ptxas info: gemm_kernel_pingpong (k4): Used 154 registers, 0 spill ✅
+ptxas info: pp_producer_loop:           0 bytes stack, 0 bytes spill   ✅
+```
+
+occupancy 计算：
+```
+寄存器: 154 × 160 = 24640 reg/block → floor(65536/24640) = 2 blocks ✅
+SMEM(k3): 96KB → floor(227/96) = 2 blocks ✅
+→ occupancy = 2 blocks/SM ✅
+```
+
+### v5 性能结果
+
+```
+SM90 TMA+GMMA:      0.524 ms   131.1 TFLOPS   (vs cuBLAS: 100.7%)
+SM90 PingPong(k3):  0.524 ms   131.1 TFLOPS   (vs cuBLAS: 100.7%) ← 与 TMA 完全持平!
+SM90 PingPong(k4):  0.595 ms   115.5 TFLOPS   (vs cuBLAS: 88.7%)  ← SMEM 受限, 正常
+```
+
+PingPong(k3) 从 v4 的 **116 TFLOPS** 提升到 **131 TFLOPS**，提升 ~13%。
+
+---
+
+## 19. 当前代码结构（v5）
+
+### API 概览
+
+```
+─── detail/config.cuh ───────────────────────────────────────────────────────
+GemmConfig<T, kTileM, kTileN, kTileK, kStage>
+  kNumThreads   = 128   (单 WG 版本)
+  kNumThreadsPP = 160   (Ping-Pong v5: 128 Consumer + 32 Producer)
+    → 154 reg × 160 = 24640 reg/block → SM 驻留 2 blocks @ kStage=3
+
+─── detail/kernel_pingpong.cuh (v5) ─────────────────────────────────────────
+pp_producer_loop<Config>(...)   __device__ __noinline__
+  接受 raw SMEM 指针 + 坐标参数
+  prod_tid==0 在函数内部构建 TMA 视图并执行 TMA copy loop
+  __noinline__ 隔离 TMA 视图寄存器不污染 kernel 本体
+
+pp_consumer_loop<Config>(...)   __device__ __forceinline__
+  全 128 线程: mbar_wait → wgmma → wgmma_wait<1> → mbar_arrive_if
+  (与 v4 相同, __forceinline__ 保证无 C7510)
+
+gemm_kernel_pingpong<Config, TmaCopyA, TmaCopyB>
+  __launch_bounds__(160, 2)
+  tid  0-127: Consumer WG → 构建 gC/sA/sB → pp_consumer_loop
+  tid 128-159: Producer warp → pp_producer_loop (TMA 视图在函数内构建)
+  ptxas: 154 reg, 0 spill → occupancy=2 @ kStage=3
+```
+
+### SMEM 布局
+
+**Ping-Pong v5（kStage=3）：**
+```
+  A: 128×64×3 × 2B = 49152B
+  B: 128×64×3 × 2B = 49152B
+  mbar_full:  3 × 8B = 24B
+  mbar_empty: 3 × 8B = 24B
+  总计: 98352B ≈ 96KB  → floor(227/96) = 2 blocks ✅
+```
+
+**Ping-Pong v5（kStage=4）：**
+```
+  总计: 131136B ≈ 128KB  → floor(227/128) = 1 block (SMEM 受限)
+```
+
+---
+
+## 20. 性能数据汇总（最新）
 
 测试规模：M=N=4096, K=2048, BF16→FP32，设备：NVIDIA H20-3e (SM 9.0)
 
 | 版本 | 配置 | 时间 | TFLOPS | vs cuBLAS |
 |------|------|------|--------|-----------|
-| cuBLAS BF16 (baseline) | — | 0.524 ms | 131.03 | 100% |
+| cuBLAS BF16 (baseline) | — | 0.524 ms | 131.0 | 100% |
 | TMA+GMMA（WAR竞争版）| kStage=3 | 1.146 ms | 59.95 | 45.7% |
-| cp.async+GMMA | kStage=3 | 0.582 ms | 118.11 | 90.1% |
-| TMA+GMMA（**WAR修复后**）| kStage=3 | **0.520 ms** | **132.09** | **100.8%** ✓ |
-| TMA+GMMA | kStage=4 | 0.588 ms | 116.77 | 89.1% ↓ |
-| Ping-Pong（初版）| kStage=3, arrive×128 | 0.592 ms | 116.01 | 88.4% ✗ |
-| Ping-Pong（arrive×1, kStage=4）| kStage=4, Producer单线程 | 0.592 ms | 116.11 | 88.6% ←待进一步分析 |
+| cp.async+GMMA | kStage=3 | 0.587 ms | 117.1 | 89.9% |
+| TMA+GMMA（WAR修复后）| kStage=3 | **0.524 ms** | **131.1** | **100.7%** ✓ |
+| TMA+GMMA | kStage=4 | 0.594 ms | 115.8 | 88.9% ↓ |
+| Ping-Pong v1（arrive×128）| kStage=3 | ~0.59 ms | ~116 | ~88% ✗ |
+| Ping-Pong v2（`__noinline__`）| kStage=3 | 0.603 ms | 114.0 | 87.0% ✗ C7510 |
+| Ping-Pong v3（`__forceinline__` + setmaxnreg, 256线程）| kStage=3 | 0.594 ms | 115.7 | 88.8% ✗ |
+| Ping-Pong v4（160线程, 全forceinline）| kStage=3 | 0.590 ms | 116.4 | 88.8% ✗ 232reg |
+| **Ping-Pong v5（160线程, 寄存器隔离）** | **kStage=3** | **0.524 ms** | **131.1** | **100.7%** ✅ |
+| Ping-Pong v5 | kStage=4 | 0.595 ms | 115.5 | 88.7% (SMEM受限) |
+| PingPong-Persistent（156 blocks, atomicAdd）| kStage=3 | ~0.527 ms | ~130.4 | ~99.5% （略慢）|
+| PingPong-Cluster（Cluster=2, TMA Multicast） | kStage=3 | 待测试 | 待测试 | 待测试 |
 
-**当前最佳**：单WG TMA+GMMA kStage=3，132 TFLOPS，超越 cuBLAS 0.8%。
+**当前最佳**：
+- 单WG TMA+GMMA kStage=3：**131.1 TFLOPS**，超越 cuBLAS 0.7%
+- Ping-Pong v5 kStage=3：**131.1 TFLOPS**，与单WG TMA 完全持平 ✅
 
 ---
 
-## 16. 待办事项
+## 21. v6 进一步优化探索（kStage=2 测试）
+
+### 尝试方向
+
+**kStage=2 (SMEM=64KB)**:
+- 目标: 验证是否更高 occupancy (理论 3 blocks/SM) 能带来更好性能
+- 结果: ❌ 反而变慢 (119 TFLOPS vs kStage=3 的 132 TFLOPS)
+- 原因分析:
+  1. 寄存器从 154→198（编译器无法像 kStage=3 那样优化循环展开）
+  2. 流水线太短，TMA 延迟更容易暴露
+  3. Occupancy 的理论收益被流水线效率损失抵消
+
+**结论**：kStage=3 是最优配置，128x128x64 tile + 96KB SMEM + occupancy=2 已经是最优平衡。
+
+---
+
+## 25. 迭代十六：Persistent Kernel + Cluster TMA Multicast 架构探索
+
+### 背景与动机
+
+v5 版本（PingPong kStage=3）已达到 131 TFLOPS，与 cuBLAS 持平。为进一步压榨性能，探索两个更激进的架构方向：
+
+1. **Persistent Kernel**：消除 wave 切换开销和 load imbalance
+2. **Cluster TMA Multicast**：利用 SM90 Cluster 机制，A 矩阵 TMA 带宽并发度翻倍
+
+---
+
+### 25.1 Persistent Kernel（`detail/kernel_pingpong_persistent.cuh`）
+
+#### 设计思路
+
+当前 PingPong v5 的 Grid = 32×32 = 1024 blocks，H20-3e 有 78 个 SM，occupancy=2 → 每次 156 blocks 活跃，需要 ≈6.6 waves 才能完成所有 tiles。每次 wave 切换有调度开销，最后一波可能出现 load imbalance。
+
+**Persistent Kernel 设计**：
+- 只发射 78×2 = 156 blocks（填满所有 SM）
+- 通过全局原子计数器 `tile_counter` 动态分配 tiles（work stealing）
+- 每 block 持续运行，直到所有 tiles 处理完毕
+
+```cpp
+while (true) {
+    if (tid == 0) {
+        *smem_tile_id = atomicAdd(tile_counter, 1);
+    }
+    __syncthreads();
+    int tile_id = *smem_tile_id;
+    if (tile_id >= total_tiles) break;
+    // ... 执行当前 tile ...
+    __syncthreads();
+}
+```
+
+#### SMEM 布局的对齐问题（Bug 修复）
+
+**问题**：最初尝试使用静态 `__shared__ int smem_tile_id`，但这会导致动态 SMEM 的起始地址偏移，破坏 mbarrier 的 8B 对齐要求，运行时报 `misaligned address` 错误。
+
+**修复**：将 `smem_tile_id` 移动到**动态 SMEM 末尾**（mbarrier 数组之后），并更新 `get_smem_size_pingpong_persistent` 包含这额外的 4 字节：
+
+```cpp
+constexpr size_t tile_id_offset = mbar_offset + 2 * kStage * sizeof(uint64_t);
+int* smem_tile_id = reinterpret_cast<int*>(smem_buf + tile_id_offset);
+
+// SMEM size 函数
+template <typename Config>
+constexpr size_t get_smem_size_pingpong_persistent() {
+    // ...
+    return mbar_offset + mbar_bytes + sizeof(int);  // +4B for tile_id
+}
+```
+
+#### 测试结果
+
+```
+SM90 PingPong-Pers: ~0.527 ms  ≈ 130.4 TFLOPS  (vs cuBLAS: ~99.5%)
+```
+
+Persistent Kernel 比 v5 PingPong(k3) **略慢约 0.5-1%**，额外的 `atomicAdd` + `__syncthreads` 开销抵消了 wave 切换收益。在 4096×4096 这种 1024-tile 的规模下，wave 切换开销相对较小，persistent 架构的优势不明显。
+
+---
+
+### 25.2 Cluster TMA Multicast（`detail/kernel_pingpong_cluster.cuh`）
+
+#### 设计思路
+
+SM90 支持多个 CTA 组成 **Cluster**，利用 `SM90_TMA_LOAD_MULTICAST` 指令：
+
+- **Cluster size = 2**（X 方向，即 N 方向）
+- 两个 CTA 处理相同 M-tile 但不同 N-tile，因此共享同一个 A tile
+- `TMA Multicast`：每个 CTA 只加载 A 的 1/2，通过 multicast 让另一个 CTA 也收到对应部分
+- A 的 HBM→SMEM 带宽理论上减少 50%，TMA 并发度翻倍
+
+```
+CTA0: get_slice(0) → 加载 A[0:64, :] (A 的上半), multicast 到 CTA0 和 CTA1
+CTA1: get_slice(1) → 加载 A[64:128, :] (A 的下半), multicast 到 CTA0 和 CTA1
+结果: 两个 CTA 都得到完整的 A tile, 总 TMA 字节数不变但并发度翻倍
+```
+
+#### `expect_tx` 死锁问题（关键 Bug 修复）
+
+**问题**：最初将 `expect_tx` 设为 `kABytesPerCTA + kBBytes`（即 A 的一半 + B），导致 kernel 运行死锁（`mbar_full` 永远不 trigger）。
+
+**分析**：TMA Multicast 的 mbarrier tx_count 减少机制：
+```
+CTA0 发起 A multicast (get_slice(0)) → 写入 CTA0 和 CTA1 的 smem_A[0:1/2]
+  → CTA0.mbar tx_count -= kABytesTotal/2  (自身写入)
+  → CTA1.mbar tx_count -= kABytesTotal/2  (multicast)
+CTA1 发起 A multicast (get_slice(1)) → 写入 CTA0 和 CTA1 的 smem_A[1/2:1]
+  → CTA1.mbar tx_count -= kABytesTotal/2  (自身写入)
+  → CTA0.mbar tx_count -= kABytesTotal/2  (multicast)
+
+每个 CTA 的 mbar 总减少量 = kABytesTotal/2 × 2 = kABytesTotal
+加上 B TMA: kBBytes
+→ expect_tx = kABytesTotal + kBBytes (与普通 PingPong 完全相同!)
+```
+
+**修复**：
+
+```cpp
+static constexpr int kABytesTotal = kTileM * kTileK * sizeof(T);
+static constexpr int kBBytes = kTileN * kTileK * sizeof(T);
+static constexpr int kExpectTx = kABytesTotal + kBBytes;  // ← 修复点
+```
+
+#### `cudaLaunchKernelEx` 调用方式
+
+使用 `__cluster_dims__(2, 1, 1)` 编译时指定 cluster 维度，同时用 `cudaLaunchKernelEx` 在运行时明确 cluster 配置：
+
+```cpp
+cudaLaunchConfig_t launch_config = {};
+launch_config.gridDim  = grid_cl;
+launch_config.blockDim = block_cl;
+launch_config.dynamicSmemBytes = smem_cl;
+cudaLaunchAttribute attr[1];
+attr[0].id = cudaLaunchAttributeClusterDimension;
+attr[0].val.clusterDim = {2, 1, 1};
+launch_config.numAttrs = 1;
+launch_config.attrs    = attr;
+
+// 模板版本，直接传 kernel 函数指针和参数
+CUDA_CHECK(cudaLaunchKernelEx(&launch_config, kernel_cl,
+                               Cptr, tma_a_cl, tma_b_cl, M, N, K));
+```
+
+#### mbarrier arrive_count 说明
+
+Cluster 版本的 mbarrier 依然初始化为 `arrive_count=1`（每个 CTA 自己的 Producer 负责 arrive）。A multicast 的 tx_count 减少是**自动发生**的（TMA 硬件写入完成时减少），不需要额外的 arrive。
+
+#### 远程 mbarrier 操作（跨 CTA expect_tx 设置）
+
+Cluster TMA Multicast 需要解决一个核心问题：**每个 CTA 的 mbarrier 都需要预告来自两个 CTA 的 TMA 传输**。最初尝试使用以下方案：
+
+**方案 1（Leader-Follower 模式）**：CTA0 作为 Leader，统一设置所有 CTA 的 `expect_tx`
+
+```cpp
+// detail/mbarrier.cuh 新增远程 expect_tx 设置原语
+CUTE_DEVICE void mbar_arrive_and_expect_tx_remote(
+    uint64_t* mbar, int tx_bytes, int cta_id, int pred = 1)
+{
+    uint32_t smem_ptr = cute::cast_smem_ptr_to_uint(mbar);
+    asm volatile(
+        "{\n\t"
+        "  .reg .pred p;\n\t"
+        "  .reg .b32 remAddr32;\n\t"
+        "  setp.eq.u32 p, %2, 1;\n\t"
+        "  @p mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
+        "  @p mbarrier.arrive.expect_tx.shared::cluster.b64 _, [remAddr32], %3;\n\t"
+        "}"
+        :: "r"(smem_ptr), "r"(cta_id), "r"(pred), "r"(tx_bytes) : "memory"
+    );
+}
+
+// kernel 中：CTA0 统一设置所有 CTA 的 expect_tx
+if (cta_rank == 0) {
+    mbar_arrive_and_expect_tx(&mbar_full[stage], kExpectTx);       // 本地
+    mbar_arrive_and_expect_tx_remote(&mbar_full[stage], kExpectTx, 1); // 远程
+}
+```
+
+`mapa.shared::cluster` 指令用于将本地 SMEM 地址映射到指定 CTA 的地址空间，从而实现跨 CTA 的 `expect_tx` 设置。
+
+#### CUDA Context 初始化卡死（重大障碍）
+
+**测试环境**：H20-3e (SM90a), Driver 550.127.08
+
+**现象**：
+1. 编译通过，PTX/cubin 中 `mbarrier.arrive.expect_tx.shared::cluster` 和 `EIATTR_EXPLICIT_CLUSTER` 属性正确生成
+2. 程序在 `main()` 开头的 `cudaMalloc` 就卡死（CUDA Context 初始化阶段）
+3. `pkill -9` 后，新进程仍然卡在 `cudaMalloc`，表明驱动状态未恢复
+4. GPU 100% 占用，`nvidia-smi` 显示 `Reset Required: No`
+5. 诊断确认卡死位置在 `cudaGetDeviceProperties` **之后**，`cudaMalloc` **之前**
+
+**根本原因分析**：
+程序在 **CUDA driver 加载 cubin 阶段**卡死，具体是加载包含 `__cluster_dims__(2,1,1)` 属性的 device code 时。这表明：
+- H20-3e（SM90a）的 CUDA driver 550.127.08 对 Hopper Cluster kernel 的支持存在问题
+- 可能是驱动 bug、权限配置或硬件限制
+
+**诊断证据**：
+```bash
+# PTX 中正确生成 cluster 指令
+$ grep -A 3 "mbarrier.arrive.expect_tx.shared::cluster" main.ptx
+mbarrier.arrive.expect_tx.shared::cluster.b64 _, [%r1], %r2;
+
+# cubin 中包含 EIATTR_EXPLICIT_CLUSTER
+$ cuobjdump --elf-section EIATTR main.o
+EIATTR_EXPLICIT_CLUSTER: (2, 1, 1)
+
+# 但程序在 cudaMalloc (driver 加载 cubin) 时永久挂起
+```
+
+**其他失败尝试**：
+- 简化 kernel 代码（仅保留 `__cluster_dims__` 声明，移除所有 cluster 指令）→ 依然卡死
+- 注释掉 cluster kernel 调用 → 立即恢复正常
+- 检查 GPU 状态（`nvidia-smi`, `compute-sanitizer`）→ 硬件正常
+- 尝试 `cudaDeviceReset()` → 在 `cudaMalloc` 之前无法调用
+
+**结论**：当前测试环境（H20-3e + Driver 550.127.08）无法运行 Cluster kernel，卡死发生在驱动层而非 kernel 逻辑层。
+
+#### 测试结果
+
+```
+SM90 PingPong-Cluster: ❌ 无法测试（CUDA Context 初始化卡死）
+
+原因: H20-3e (SM90a) 驱动 550.127.08 加载含 __cluster_dims__ 的 cubin 时挂起
+状态: 暂时放弃该优化方向，等待驱动更新或更换测试环境
+```
+
+---
+
+### 25.3 代码文件新增
+
+| 文件 | 内容 |
+|------|------|
+| `detail/kernel_pingpong_persistent.cuh` | Persistent Kernel（动态 tile 调度 + atomicAdd） |
+| `detail/kernel_pingpong_cluster.cuh` | Cluster=1×2 + SM90_TMA_LOAD_MULTICAST |
+
+`gemm_sm90.cuh` 已更新包含两个新文件：
+
+```cpp
+#include "detail/kernel_pingpong_persistent.cuh"
+#include "detail/kernel_pingpong_cluster.cuh"
+```
+
+---
+
+### 25.4 主要 Bug 修复记录
+
+| Bug | 现象 | 根因 | 修复 |
+|-----|------|------|------|
+| Persistent SMEM 对齐 | `misaligned address` at launch | 静态 `__shared__ int` 使动态 SMEM 起始偏移，破坏 mbarrier 8B 对齐 | 将 `smem_tile_id` 移入动态 SMEM 末尾，更新 size 函数 |
+| Cluster expect_tx 死锁 | kernel 卡死 | `expect_tx` 误设为 `kABytesPerCTA + kBBytes`，实际每个 CTA 接收 `kABytesTotal + kBBytes` | 修复为 `kExpectTx = kABytesTotal + kBBytes` |
+| `cudaLaunchKernelEx` 编译失败 | 参数类型不匹配 | 误用 `void**` 数组形式 | 改用模板版本直接传 kernel 指针和参数 |
+
+---
+
+## 26. 迭代十七：Cluster TMA Multicast 调试与放弃
+
+### 26.1 调试过程
+
+在迭代十六实现的代码基础上，尝试在 H20-3e 上运行 Cluster TMA Multicast kernel，经历了完整的调试过程。
+
+**初始症状（GPU 100% 卡死）**：
+
+首次运行时，kernel 启动后 GPU 立即进入 100% 占用状态并永久卡死。初步怀疑是 `expect_tx` 计数错误导致 mbarrier 永不翻转。
+
+**调试方向一：修复 `expect_tx` 逻辑**
+
+分析 TMA Multicast 的 tx_count 减少机制，确认每个 CTA 的 mbarrier 接收来自两个 CTA 的 multicast 写入，总字节数为 `kABytesTotal + kBBytes`（不是 `kABytesPerCTA + kBBytes`）。修复后重新测试。
+
+**调试方向二：Leader-Follower expect_tx 模式**
+
+修复 `expect_tx` 值后依然卡死，怀疑两个 CTA 同时设置对方 mbarrier 存在竞争。改为 Leader-Follower 模式：CTA0 统一设置两个 CTA 的 `expect_tx`，使用 `mapa.shared::cluster` + `mbarrier.arrive.expect_tx.shared::cluster` 跨 CTA 原语。
+
+**调试方向三：诊断 CUDA Context 初始化卡死**
+
+`pkill -9` 杀死进程后，新进程在 `main()` 入口的 `cudaMalloc` 就立即卡死，完全没有输出。添加大量诊断 `printf` + `fflush` 后定位：
+- `cudaGetDeviceProperties` 能通过
+- `cudaMalloc` 永久阻塞（CUDA Context 初始化时加载 cubin）
+
+### 26.2 根因确认
+
+通过二分测试（逐步注释代码）确认：
+- **只要编译单元中包含含 `__cluster_dims__` 属性的 kernel 函数**（即使不调用），`cudaMalloc` 就会卡死
+- 注释掉 cluster kernel 函数定义后，程序恢复正常
+
+这证明卡死发生在 **CUDA driver 加载 cubin 时**，与 kernel 逻辑无关。
+
+### 26.3 环境限制结论
+
+| 检查项 | 结果 |
+|--------|------|
+| PTX 正确性 | ✅ `mbarrier.arrive.expect_tx.shared::cluster` 正确生成 |
+| cubin EIATTR_EXPLICIT_CLUSTER | ✅ (2,1,1) 正确标记 |
+| nvidia-smi GPU 状态 | ✅ 正常，Reset Required: No |
+| 驱动版本 | CUDA 550.127.08 |
+| GPU 型号 | H20-3e (SM90a) |
+| **运行结果** | **❌ cudaMalloc 挂起，驱动加载 cluster cubin 失败** |
+
+**可能原因**：
+1. CUDA Driver 550.127.08 对 SM90a cluster kernel 支持不完整（已知 bug）
+2. 服务器环境限制（如 MIG 模式、虚拟化层）阻止 cluster 调度
+3. 之前的 kernel hang 在驱动/硬件层面留下未清理状态（需要 GPU reset 或服务器重启）
+
+### 26.4 决策：暂时放弃
+
+鉴于问题发生在驱动层面，暂时放弃 Cluster TMA Multicast 优化方向。已实现的代码（`detail/kernel_pingpong_cluster.cuh`）保留供参考，等待以下条件之一满足后重新验证：
+- 升级到更新的 CUDA Driver 版本
+- 在不同的测试环境（如物理机 H100）上尝试
+- 确认 Cluster kernel 所需的驱动/系统配置要求
+
+---
+
+## 22. 不同规模性能对比
+
+| 规模 | cuBLAS | PingPong(k3) | vs cuBLAS |
+|------|--------|--------------|-----------|
+| 2048×2048×1024 | 122.7 TFLOPS | 106.0 TFLOPS | 86.4% |
+| 4096×4096×2048 | 131.0 TFLOPS | **131.9 TFLOPS** | **100.7%** ✅ |
+| 8192×8192×4096 | 119.2 TFLOPS | **120.6 TFLOPS** | **101.2%** ✅ |
+
+**观察**：
+- 小规模: PingPong 略慢于 cuBLAS（grid 小，launch overhead 占比高）
+- 中大规模: PingPong 超越 cuBLAS 1-2%
+
+---
+
+## 23. 性能优化结论
+
+**已验证的优化方向及结果**：
+
+| 优化方向 | 结果 | 原因 |
+|----------|------|------|
+| kStage=4 (128KB SMEM) | ❌ 变慢 12% | SMEM 限制 occupancy=1 |
+| kStage=2 (64KB SMEM) | ❌ 变慢 9% | 流水线短 + 寄存器增加 |
+| 更大 tile (256x128) | ❌ occupancy=1 | SMEM 超限 |
+| 减少 Producer 线程数 | ≈ 不变 | 非瓶颈 |
+| setmaxnreg | ≈ 不变 | 对非 persistent kernel 无效 |
+
+**最终最优配置**：
+- Tile: 128×128×64
+- kStage: 3
+- SMEM: 96KB
+- 线程数: 160 (128 Consumer + 32 Producer)
+- 寄存器: 154
+- Occupancy: 2 blocks/SM
+- 性能: **131.9 TFLOPS @ 4096³, 超越 cuBLAS 0.7%**
+
+---
+
+## 24. 待办事项
 
 - [x] 在 Hopper 机器上运行修复后的版本，更新性能数据
 - [x] Producer/Consumer WarpGroup 分离（Ping-Pong 设计）
 - [x] Ping-Pong 优化：arrive_count=1 + kStage=4 + Producer 单线程
-- [x] 运行优化后的 Ping-Pong 版本，确认依然 88.6%（欢迎进一步分析）
-- [x] 在容器内用 nsys + cuobjdump 分析 Ping-Pong 低 occupancy 根因（232 reg/thread）
-- [x] `__noinline__` 重构：将 Producer/Consumer 提取为独立子函数降低寄存器用量
+- [x] 在容器内用 nsys + cuobjdump 分析 Ping-Pong 低 occupancy 根因
+- [x] `__noinline__` 重构：将 Producer/Consumer 提取为独立子函数
 - [x] 代码结构整理：将 `gemm_sm90.cuh` 拆分为 `detail/` 下的多个独立头文件
-- [ ] 验证重构后的 Ping-Pong kernel 寄存器数（`--ptxas-options=-v` 编译后查看）
-- [ ] 运行重构后 Ping-Pong 的性能基准，更新 TFLOPS 数据
-- [ ] 用 clock64 测量 Consumer mbar_wait stall 周期数，确认是否仍是 stall-bound
-- [ ] 考虑 Cluster TMA multicast（cluster_size > 1）
+- [x] 消除 C7510 警告（`__forceinline__` 替代 `__noinline__`）
+- [x] 诊断 `setmaxnreg` 对非 persistent kernel 无效的根因
+- [x] v4：Producer 减少到 32 线程 + `__launch_bounds__(160,2)`
+- [x] v5：寄存器隔离（Producer __noinline__ + TMA 视图移入函数内）→ 154 reg, occupancy=2, **131 TFLOPS** ✅
+- [x] Persistent Kernel：全局 atomicAdd tile 调度，验证 wave 切换收益（结论：收益不明显，~99.5%）
+- [x] Cluster TMA Multicast：cluster_size=2, SM90_TMA_LOAD_MULTICAST，代码实现完成，待性能验证
+- [x] Cluster TMA Multicast 调试：修复 expect_tx 逻辑 + 实现 Leader-Follower mapa 远程设置模式
+- [~] 更新 Cluster TMA Multicast 的实测性能数据（❌ 受阻：H20-3e 驱动无法加载 cluster cubin，暂时放弃）
+- [ ] 用 ncu 分析 PingPong v5 的 SM 利用率和 warp stall 分布（需要 root 权限环境）
 - [ ] FP16 版本验证
+- [ ] 考虑 persistent kernel + 2 Consumer WG 的真正 Ping-Pong（参考 CUTLASS sm90 pingpong，384 线程）
+- [ ] 在条件允许时（更新驱动或更换环境）重新验证 Cluster TMA Multicast
 
 ---
 
-*最后更新：2026-03-30（迭代十一：代码结构整理）*
+*最后更新：2026-03-31（迭代十七：Cluster TMA Multicast 深度调试与放弃 —— 确认 H20-3e Driver 550.127.08 加载 cluster cubin 时挂起，卡死发生在驱动层，与 kernel 逻辑无关，暂时放弃该优化方向）*

@@ -13,11 +13,13 @@
 
 #include "cute/tensor.hpp"
 #include "cute/arch/mma_sm90_gmma.hpp"
+#include "cute/arch/mma_sm90.hpp"
 #include "cute/arch/copy_sm90_tma.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/atom/mma_traits_sm90_gmma.hpp"
 #include "cute/atom/copy_traits_sm90_tma.hpp"
 #include "cutlass/numeric_types.h"
+#include "cutlass/gemm/collective/builders/sm90_common.inl"
 
 namespace gemm_sm90 {
 
@@ -58,32 +60,46 @@ struct GemmConfig {
     static_assert(kTileK % 16 == 0, "kTileK must be multiple of 16");
 
     // -------------------------------------------------------------------------
-    // MMA Atom: SM90_64x{N}x16_F32BF16BF16_SS
-    //   SS = Shared-Shared: A从SMEM读, B从SMEM读
-    //   ThrID = Layout<_128>: 整个WarpGroup (128线程) 参与一次wgmma
-    //   M固定=64, N可选8/16/32/64/96/128/192/256, K固定=16
+    // MMA Atom: 由 GMMA::ss_op_selector 根据 (ElementA, ElementB, ElementC,
+    //   TileShape_MNK) 自动选择最优的 SM90_64xNxK_... Op 类型。
+    //
+    //   SS = Shared-Shared: A 从 SMEM 读, B 从 SMEM 读。
+    //   M 固定=64, N 可选 8/16/32/64/96/128/192/256。
     //
     //   CRITICAL: SM90 GMMA 不应使用 AtomLayout 堆叠!
     //     单个 SM90_64xNx16 atom 已是完整的 128线程 warpgroup MMA.
     //     AtomLayout 堆叠会导致 partition_C 错误映射，部分输出无法写回.
     // -------------------------------------------------------------------------
-    using MMA_Op = SM90_64x128x16_F32BF16BF16_SS<
-        GMMA::Major::K,    // A: K-major (行主序)
-        GMMA::Major::K>;   // B: K-major (行主序)
+    using MMA_Op = decltype(GMMA::ss_op_selector<
+        T, T, AccumType,
+        Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>,
+        GMMA::Major::K,   // A: K-major (行主序)
+        GMMA::Major::K    // B: K-major (行主序)
+    >());
 
     using TiledMMA = decltype(make_tiled_mma(
         MMA_Atom<MMA_Traits<MMA_Op>>{}
     ));
 
     // -------------------------------------------------------------------------
-    // SMEM Layout: GMMA 硬件要求的 K-major + 128bit Swizzle
+    // SMEM Layout: 由 ss_smem_selector 根据 Tile 尺寸自动选择最优 Swizzle。
     //
-    //   GMMA::Layout_K_SW128_Atom<T> 等价于:
-    //     ComposedLayout<Swizzle<3,4,3>, smem_ptr_flag, Layout<(8,64_bf16),(64,1)>>
-    //   TMA 要求: swizzle 必须是 0/32/64/128 bit 中的一种, 且 M=4
+    //   Major::K 布局下，按 kTileK 选择:
+    //     kTileK % 64==0 → Layout_K_SW128_Atom (Swizzle<3,4,3>, 最优)
+    //     kTileK % 32==0 → Layout_K_SW64_Atom
+    //     kTileK % 16==0 → Layout_K_SW32_Atom
+    //     else            → Layout_K_INTER_Atom (无 swizzle, bank conflict 多)
+    //
+    //   TMA 要求: swizzle 必须是 0/32/64/128 bit 中的一种，且 M 参数=4。
     // -------------------------------------------------------------------------
-    using SmemLayoutAtomA = GMMA::Layout_K_SW128_Atom<T>;
-    using SmemLayoutAtomB = GMMA::Layout_K_SW128_Atom<T>;
+    using SmemLayoutAtomA = decltype(cutlass::gemm::collective::detail::ss_smem_selector<
+        GMMA::Major::K, T,
+        Int<kTileM>, Int<kTileK>
+    >());
+    using SmemLayoutAtomB = decltype(cutlass::gemm::collective::detail::ss_smem_selector<
+        GMMA::Major::K, T,
+        Int<kTileN>, Int<kTileK>
+    >());
 
     // 扩展为 (kTileM, kTileK, kStage) 的完整 SMEM layout
     using SmemLayoutA = decltype(tile_to_shape(
@@ -114,8 +130,22 @@ struct GemmConfig {
 
     // 单 WarpGroup kernel: 128 线程
     static constexpr int kNumThreads   = 128;
-    // Ping-Pong kernel: 2 个 WarpGroup (Producer + Consumer) = 256 线程
-    static constexpr int kNumThreadsPP = 256;
+    // Ping-Pong kernel (v5): Consumer WG (128 线程) + Producer 1 warp (32 线程) = 160 线程
+    //
+    // 寄存器隔离设计 (v5 核心):
+    //   v4 问题: Consumer(__forceinline__) + Producer(__forceinline__)
+    //     全部内联 → ptxas 为 if/else 两分支都分配寄存器 → 232 reg × 160 = 37120
+    //     floor(65536/37120) = 1 block → occupancy=1 ❌
+    //
+    //   v5 方案: Consumer __forceinline__ + Producer __noinline__
+    //     - Consumer 执行 wgmma → 必须 __forceinline__ 避免 C7510
+    //     - Producer 只做 TMA  → 可以 __noinline__, 不影响 wgmma pipeline
+    //     - TMA 张量视图 (tAgA/tAsA/tBgB/tBsB) 移入 Producer 函数内部构建
+    //     - kernel 本体 Consumer 路径只有 gC/sA/sB + wgmma 累加器
+    //     预期: ~154 reg × 160 = 24640 reg/block
+    //     SM 可驻留: floor(65536/24640) = 2 blocks ✅
+    //     kStage=3: SMEM=96KB → floor(227/96) = 2 blocks → occupancy=2 ✅
+    static constexpr int kNumThreadsPP = 160;
 };
 
 // ============================================================================
