@@ -41,12 +41,25 @@ using namespace cute;
 // 辅助函数
 // ============================================================================
 
-// syncwarpgroup: 命名屏障同步 128 线程 (一个 WarpGroup)
-// bar.sync id, count: 等 count 个线程到达 id 号屏障
-// WG0 用 id=0, WG1 用 id=1
-// 注意: 使用 bar.sync (与 CUTLASS NamedBarrier 实现一致), 而非 barrier.cta.sync
+// syncwg0: 同步 Consumer WG (id=0, 128 线程)
+// 版本 A (160线程 kernel): Consumer 是 tid 0-127 (128线程), Producer 是 tid 128-159 (32线程)
+//
+// 使用 bar.sync (旧版命名屏障, SM30+), 不使用 barrier.cta.sync (PTX 7.8新指令,
+// 某些驱动版本不支持导致 Illegal instruction)
+//
+// bar.sync id, count: 等待 count 个线程都到达 barrier id 处
+//   id=0:   使用 barrier slot 0 (Consumer WG 专用)
+//   count=128: 只需要 128 个 Consumer 线程参与, Producer 线程不参与
+//
+// 注意: bar.sync 是 aligned 版本 (count 必须是 warp_size=32 的倍数), 128 满足条件
+__device__ __forceinline__ void syncwg0() {
+    asm volatile("bar.sync 0, 128;\n" ::: "memory");
+}
+
+// syncwg: 兼容两种调用方式 (id=0 → syncwg0)
 __device__ __forceinline__ void syncwg(int id) {
-    asm volatile("bar.sync %0, 128;\n" :: "r"(id) : "memory");
+    // 由于 id 总是 0 (版本 A 只有一个 WG), 直接使用立即数版本
+    syncwg0();
 }
 
 // TMA Store fence: 保证 SMEM 写入对 TMA 硬件可见
@@ -56,14 +69,15 @@ __device__ __forceinline__ void tma_store_fence() {
 }
 
 // TMA Store arrive: 提交 TMA Store 到队列 (bulk_group)
+// 使用 CUTLASS 内置实现 (CUTE_ARCH_TMA_SM90_ENABLED 保护)
 __device__ __forceinline__ void tma_store_arrive() {
-    asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+    cute::tma_store_arrive();
 }
 
 // TMA Store wait: 等待所有 in-flight TMA Store 完成
-// cp.async.bulk.wait_group.read 0 等价于等待所有已提交的 store 完成
+// cute::tma_store_wait<0>() = 等待直到 in-flight store 数量 <= 0 (全部完成)
 __device__ __forceinline__ void tma_store_wait_all() {
-    asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
+    cute::tma_store_wait<0>();
 }
 
 // ============================================================================
