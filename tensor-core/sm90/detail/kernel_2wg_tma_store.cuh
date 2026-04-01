@@ -41,37 +41,10 @@ using namespace cute;
 // 辅助函数
 // ============================================================================
 
-// syncwg0: 同步 Consumer WG (id=0, 128 线程)
-// 版本 A (160线程 kernel): Consumer 是 tid 0-127 (128线程), Producer 是 tid 128-159 (32线程)
-//
-// 使用 bar.sync (旧版命名屏障, SM30+), 不使用 barrier.cta.sync (PTX 7.8新指令,
-// 某些驱动版本不支持导致 Illegal instruction)
-//
-// bar.sync id, count: 等待 count 个线程都到达 barrier id 处
-//   id=0:   使用 barrier slot 0 (Consumer WG 专用)
-//   count=128: 只需要 128 个 Consumer 线程参与, Producer 线程不参与
-//
-// 注意: bar.sync 是 aligned 版本 (count 必须是 warp_size=32 的倍数), 128 满足条件
-__device__ __forceinline__ void syncwg0() {
-    asm volatile("bar.sync 0, 128;\n" ::: "memory");
-}
-
-// syncwg: 兼容两种调用方式 (id=0 → syncwg0)
-__device__ __forceinline__ void syncwg(int id) {
-    // 由于 id 总是 0 (版本 A 只有一个 WG), 直接使用立即数版本
-    syncwg0();
-}
-
 // TMA Store fence: 保证 SMEM 写入对 TMA 硬件可见
-// 使用 shared::cta 作用域与 CUTLASS 保持一致 (fence.proxy.async.shared::cta)
+// fence.proxy.async.shared::cta 使 TMA 硬件看到 SMEM 写入
 __device__ __forceinline__ void tma_store_fence() {
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-}
-
-// TMA Store arrive: 提交 TMA Store 到队列 (bulk_group)
-// 使用 CUTLASS 内置实现 (CUTE_ARCH_TMA_SM90_ENABLED 保护)
-__device__ __forceinline__ void tma_store_arrive() {
-    cute::tma_store_arrive();
 }
 
 // TMA Store wait: 等待所有 in-flight TMA Store 完成
@@ -143,30 +116,26 @@ __device__ __noinline__ void pp_v6_producer(
 }
 
 // ----------------------------------------------------------------------------
-// pp_v6_consumer — 带 TMA Store Epilogue 的 Consumer WG (__forceinline__)
+// pp_v6_consumer — 纯计算 Consumer WG (__forceinline__)
 //
-// 实现说明:
-//   1. FP32 累加器 → float SMEM (逐线程 STG, make_tiled_copy_C + AutoVectorizing)
-//   2. 等全 WG 写完 (syncwg)
-//   3. fence.proxy.async.shared::cta (让 TMA 硬件看到 SMEM 写入)
-//   4. wg_tid==0 发起 TMA Store
+// 只做 wgmma 主循环，不包含 epilogue。
+// 完成后累加器保留在 tCrC 寄存器中，由调用方负责写回。
 //
-// float SMEM layout: row-major (M, N) stride (N, 1), 无 swizzle
-//   TMA Store 不要求 swizzle, 只需要 128B 对齐
+// 设计原因:
+//   原来 epilogue 使用 bar.sync/barrier.cta.sync 命名屏障同步 128 个 Consumer 线程，
+//   但这些指令在本服务器的驱动版本上触发 Illegal instruction。
+//   改为在主 kernel 中用 __syncthreads() 实现全 CTA 同步，完全规避命名屏障。
 // ----------------------------------------------------------------------------
 template <typename Config, typename SmemTensorA, typename SmemTensorB,
-          typename SmemTensorC, typename TmaStoreC>
+          typename SmemTensorC>
 __device__ __forceinline__ void pp_v6_consumer(
     uint64_t* __restrict__ mbar_full,
     uint64_t* __restrict__ mbar_empty,
     SmemTensorA const& sA,
     SmemTensorB const& sB,
-    SmemTensorC& sC,        // float SMEM C buffer, row-major layout
-    TmaStoreC const& tma_c, // TMA Store copy 对象 (FP32 GMEM)
+    SmemTensorC& sC,   // float SMEM C buffer (用于 epilogue r2s, 调用方负责 TMA Store)
     int wg_tid,
-    int num_k_tiles,
-    int bx, int by,
-    int M, int N)
+    int num_k_tiles)
 {
     static constexpr int kStage = Config::kStage;
 
@@ -179,7 +148,7 @@ __device__ __forceinline__ void pp_v6_consumer(
     Tensor tCrA = thr_mma.make_fragment_A(tCsA);
     Tensor tCrB = thr_mma.make_fragment_B(tCsB);
 
-    // 累加器 (FP32): partition_C(sC) 推导形状
+    // 累加器 (FP32): 用 sC 推导形状，但计算时只写寄存器
     Tensor tCsC = thr_mma.partition_C(sC);
     Tensor tCrC = thr_mma.make_fragment_C(tCsC);
     clear(tCrC);
@@ -208,7 +177,7 @@ __device__ __forceinline__ void pp_v6_consumer(
         if (stage == 0) phase_f ^= 1;
     }
 
-    // Drain
+    // Drain: 等最后一条 wgmma 完成
     warpgroup_wait<0>();
     warpgroup_fence_operand(tCrC);
 
@@ -216,17 +185,9 @@ __device__ __forceinline__ void pp_v6_consumer(
     mbar_arrive_if(&mbar_empty[last_stage], (num_k_tiles > 0) && (wg_tid == 0));
 
     // -------------------------------------------------------------------------
-    // TMA Store Epilogue
+    // Epilogue: 累加器寄存器 → float SMEM
+    // 注意: 此时不做任何 __syncthreads/bar.sync，由调用方 (主 kernel) 负责同步
     // -------------------------------------------------------------------------
-    // Step 0: 等待上一次 TMA Store 完成 (确保 sC 空闲可写)
-    if (wg_tid == 0) {
-        tma_store_wait_all();
-    }
-    syncwg(0);
-
-    // Step 1: FP32 累加器 → float SMEM
-    // make_tiled_copy_C 正确映射 wgmma fragment 的 (thr,val) → SMEM 坐标
-    // 这里 Src 和 Dst 都是 float, AutoVectorizing 可以正确处理
     {
         auto tiled_r2s = make_tiled_copy_C(
             Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, float>{},
@@ -237,26 +198,7 @@ __device__ __forceinline__ void pp_v6_consumer(
         Tensor tRS_sC = thread_r2s.partition_D(sC);
         copy(tiled_r2s, tRS_rC, tRS_sC);
     }
-
-    // Step 2: 等全 WG 写完 SMEM
-    syncwg(0);
-
-    // Step 3: TMA Store fence (使 TMA 硬件看到 SMEM 写入)
-    tma_store_fence();
-
-    // Step 4: 发起 TMA Store (只有 wg_tid==0)
-    if (wg_tid == 0) {
-        auto mD = tma_c.get_tma_tensor(make_shape(M, N));
-        auto gD = local_tile(mD,
-                             make_tile(Int<Config::kTileM>{}, Int<Config::kTileN>{}),
-                             make_coord(by, bx));
-        auto btma_c = tma_c.get_slice(Int<0>{});
-        // sC 是 row-major 无 swizzle, 不需要 as_position_independent_swizzle_tensor
-        auto tDs = btma_c.partition_S(sC);
-        auto tDg = btma_c.partition_D(gD);
-        copy(tma_c, tDs, tDg);
-        tma_store_arrive();
-    }
+    // 返回后 sC 中已有 FP32 结果，主 kernel 用 __syncthreads() 同步后发起 TMA Store
 }
 
 // ----------------------------------------------------------------------------
@@ -336,19 +278,52 @@ gemm_kernel_pingpong_tma_store(
             blockIdx.x, blockIdx.y,
             M, N, K);
     } else {
+        // Consumer: 纯计算，Epilogue 仅做 R2S (累加器寄存器 → float SMEM)
+        // TMA Store 由主 kernel 在 __syncthreads() 之后统一发起
         pp_v6_consumer<Config>(
             mbar_full, mbar_empty,
-            sA, sB, sC, tma_c,
+            sA, sB, sC,
             wg_tid,
-            num_k_tiles,
-            blockIdx.x, blockIdx.y,
-            M, N);
+            num_k_tiles);
     }
 
+    // -------------------------------------------------------------------------
+    // __syncthreads(): 保证所有 Consumer 线程完成 R2S 写入 sC
+    // (Producer WG 线程此时已完成 TMA Load 循环, 不写 sC, 参与同步即可)
+    // -------------------------------------------------------------------------
     __syncthreads();
 
-    // 等待 TMA Store 完成 (确保 kernel 退出前数据落 GMEM)
+    // -------------------------------------------------------------------------
+    // TMA Store: tid 0 将 float SMEM → float GMEM
+    //
+    // 设计:
+    //   1. tma_store_fence()  — 保证 sC 写入对 TMA 硬件可见
+    //   2. TMA Store copy     — 异步发起 (只需 tid 0)
+    //   3. tma_store_wait_all() — 等待 TMA Store 完成再退出 kernel
+    // -------------------------------------------------------------------------
     if (tid == 0) {
+        // 构建 GMEM C tensor (FP32 row-major)
+        // 注意: TMA Store 不需要 get_tma_tensor, 使用 partition_S/partition_D
+        auto mC_gmem = tma_c.get_tma_tensor(make_shape(M, N));
+        auto gC_tile = local_tile(
+            mC_gmem,
+            make_tile(Int<kTileM>{}, Int<kTileN>{}),
+            make_coord(blockIdx.y, blockIdx.x));
+
+        // TMA Store C slice (SMEM → GMEM)
+        Tensor tCsC_store = tma_c.get_slice(Int<0>{}).partition_S(sC);
+        Tensor tCgC_store = tma_c.get_slice(Int<0>{}).partition_D(gC_tile);
+
+        // fence: 保证 SMEM 写入对 TMA 可见
+        tma_store_fence();
+
+        // 发起异步 TMA Store
+        copy(tma_c, tCsC_store, tCgC_store);
+
+        // commit_group: 提交当前 bulk_group (必须在 wait 之前)
+        cute::tma_store_arrive();
+
+        // 等待所有 TMA Store 完成后再退出 kernel
         tma_store_wait_all();
     }
 }
