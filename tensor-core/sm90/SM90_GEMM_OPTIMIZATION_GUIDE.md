@@ -20,6 +20,7 @@
 11. [Cluster TMA Multicast（环境限制）](#11-cluster-tma-multicast环境限制)
 12. [性能调试工具与方法](#12-性能调试工具与方法)
 13. [经验结论速查表](#13-经验结论速查表)
+14. [不同规模性能参考](#14-不同规模性能参考)
 
 ---
 
@@ -480,6 +481,27 @@ while (true) {
 
 **适用场景**：问题规模小（tiles 数量 ≤ 3-4 waves）时，Persistent 收益才明显。对于 GEMM 通常不值得引入额外复杂度。
 
+### SMEM 对齐陷阱（Persistent Kernel 特有）
+
+Persistent Kernel 需要在动态 SMEM 中存储 `tile_id` 计数器，**必须放在动态 SMEM 末尾**而非静态 SMEM：
+
+```cpp
+// ❌ 错误：使用 __shared__ 静态变量
+__shared__ int smem_tile_id;  // 导致动态 SMEM 起始地址偏移，破坏 mbarrier 8B 对齐 → misaligned address
+
+// ✅ 正确：将 tile_id 放在动态 SMEM 末尾
+constexpr size_t tile_id_offset = mbar_offset + 2 * kStage * sizeof(uint64_t);
+int* smem_tile_id = reinterpret_cast<int*>(smem_buf + tile_id_offset);
+
+// SMEM size 必须包含这额外 4 字节
+template <typename Config>
+constexpr size_t get_smem_size_persistent() {
+    return mbar_offset + 2 * Config::kStage * sizeof(uint64_t) + sizeof(int);  // +4B tile_id
+}
+```
+
+**根因**：`__shared__` 静态变量会占用静态 SMEM，使动态 SMEM 起始地址从对齐的地址偏移，而 mbarrier 必须 8 字节对齐。将所有辅助变量放到动态 SMEM 末尾是最安全的做法。
+
 ---
 
 ## 11. Cluster TMA Multicast（环境限制）
@@ -534,17 +556,82 @@ CUTE_DEVICE void mbar_arrive_and_expect_tx_remote(
 }
 ```
 
+### Cluster TMA Multicast 调试流程与关键 Bug
+
+#### 典型一：expect_tx 死锁
+
+**症状**：Kernel 启动后 GPU 100% 占用并永久卡死。
+
+**根因**：将 `expect_tx` 误设为 `kABytesPerCTA + kBBytes`（A 的一半 + B）。实际 TMA Multicast 中每个 CTA 的 mbarrier 接收来自**两个 CTA** 的 multicast 写入：
+
+```
+CTA0 发起 A multicast → 写入 CTA0.smem_A[0:1/2] 和 CTA1.smem_A[0:1/2]
+  → CTA0.mbar.tx_count -= kABytesTotal/2  |  CTA1.mbar.tx_count -= kABytesTotal/2
+CTA1 发起 A multicast → 写入 CTA0.smem_A[1/2:1] 和 CTA1.smem_A[1/2:1]
+  → CTA0.mbar.tx_count -= kABytesTotal/2  |  CTA1.mbar.tx_count -= kABytesTotal/2
+
+每个 CTA 的 mbar.tx_count 总减少量 = kABytesTotal + kBBytes
+// ✅ 修复：expect_tx = kABytesTotal + kBBytes（与普通 PingPong 完全相同）
+```
+
+#### 典型二：跨 CTA mbarrier 竞争（Leader-Follower 模式）
+
+两个 CTA 同时设置对方 mbarrier 的 `expect_tx` 存在竞争。最终方案：CTA0 作为 Leader 统一设置两个 CTA 的 `expect_tx`，使用 `mapa.shared::cluster` 跨 CTA 地址映射原语：
+
+```cpp
+// detail/mbarrier.cuh 新增跨 CTA 原语
+CUTE_DEVICE void mbar_arrive_and_expect_tx_remote(
+    uint64_t* mbar, int tx_bytes, int cta_id, int pred = 1)
+{
+    uint32_t smem_ptr = cute::cast_smem_ptr_to_uint(mbar);
+    asm volatile(
+        "{\n\t"
+        "  .reg .pred p;\n\t"
+        "  .reg .b32 remAddr32;\n\t"
+        "  setp.eq.u32 p, %2, 1;\n\t"
+        "  @p mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"  // 映射远端地址
+        "  @p mbarrier.arrive.expect_tx.shared::cluster.b64 _, [remAddr32], %3;\n\t"
+        "}"
+        :: "r"(smem_ptr), "r"(cta_id), "r"(pred), "r"(tx_bytes) : "memory"
+    );
+}
+
+// kernel 中：CTA0 作为 Leader 统一设置
+if (cta_rank == 0) {
+    mbar_arrive_and_expect_tx(&mbar_full[s], kExpectTx);           // 设置本地 CTA0 mbar
+    mbar_arrive_and_expect_tx_remote(&mbar_full[s], kExpectTx, 1); // 设置 CTA1 mbar
+}
+```
+
+#### `cudaLaunchKernelEx` 调用方式
+
+```cpp
+cudaLaunchConfig_t cfg = {};
+cfg.gridDim  = grid;
+cfg.blockDim = block;
+cfg.dynamicSmemBytes = smem_size;
+cudaLaunchAttribute attr[1];
+attr[0].id = cudaLaunchAttributeClusterDimension;
+attr[0].val.clusterDim = {2, 1, 1};
+cfg.numAttrs = 1; cfg.attrs = attr;
+// ✅ 模板版本，直接传 kernel 函数指针和参数（勿用 void** 数组形式）
+CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel_func, arg1, arg2, ...));
+```
+
 ### ⚠️ 环境限制（H20-3e + Driver 550.127.08）
 
 **症状**：程序在 `cudaMalloc`（CUDA Context 初始化阶段）永久挂起。
 
 **根因**：CUDA driver 加载含 `__cluster_dims__` 属性的 cubin 时死锁，与 kernel 逻辑无关。
 
+**关键证据**：只要编译单元中包含含 `__cluster_dims__` 属性的 kernel **函数定义**（即使不调用），`cudaMalloc` 就会卡死。注释掉定义后恢复正常 → 确认卡死发生在 **CUDA driver 加载 cubin 阶段**。
+
 **诊断方法**：
 ```bash
 # 验证 cubin 内容正确
 cuobjdump --dump-ptx main.o | grep -A3 "cluster"
 # 若注释掉 cluster kernel 函数定义（不是调用），挂起消失 → 确认是驱动加载问题
+cuobjdump --elf-section EIATTR main.o | grep EXPLICIT_CLUSTER  # 确认 cluster 属性已正确标记
 ```
 
 **建议**：Cluster kernel 需要在以下环境验证：
@@ -638,8 +725,54 @@ echo "scale=2; $smem_per_sm / $smem_per_block" | bc
 | PingPong v4（全 forceinline，232 reg） | 0.590 ms | 116.4 | 88.8% |
 | **PingPong v5（寄存器隔离，154 reg）** | **0.524 ms** | **131.1** | **100.7%** ✅ |
 | Persistent Kernel（156 blocks） | 0.527 ms | 130.4 | 99.5% |
-| Cluster TMA Multicast | ❌ 驱动挂起 | — | — |
+| Cluster TMA Multicast | ❌ 驱动挂起（Driver 550 加载 cluster cubin 失败） | — | — |
 
 ---
 
-*整理自 SM90 GEMM 手写优化实践，2026-03-31*
+## 14. 不同规模性能参考
+
+### H20-3e 实测性能（PingPong v5, BF16→FP32）
+
+| 规模 | cuBLAS | PingPong v5 | vs cuBLAS |
+|------|--------|------------|--------|
+| 2048×2048×1024 | 122.7 TFLOPS | 106.0 TFLOPS | 86.4% |
+| 4096×4096×2048 | 131.0 TFLOPS | **131.1 TFLOPS** | **100.7%** ✅ |
+| 8192×8192×4096 | 119.2 TFLOPS | **120.6 TFLOPS** | **101.2%** ✅ |
+
+### 性能随规模变化的内在逻辑
+
+**小规模性能下降原因**：
+
+```
+2048×2048×1024: (2048/128)×(2048/128) = 256 tiles
+H20 occupancy=2 → 78×2 = 156 活跃 blocks
+256 tiles / 156 blocks ≈ 1.6 waves → 第2个 wave 只有 100 blocks 有效
+SM 平均利用率 ≈ 62%，性能约 106 TFLOPS
+```
+
+**大规模超越 cuBLAS 的原因**：
+
+```
+8192×8192×4096: (8192/128)×(8192/128) = 4096 tiles
+4096 / 156 ≈ 26 waves → SM 长期满载
+手写 Ping-Pong 流水线更充分，超越 cuBLAS ~1.2%
+```
+
+### Persistent Kernel 对不同规模的收益分析
+
+```
+小规模（256 tiles / 156 blocks ≈ 1.6 waves）：
+  普通 kernel 第2个 wave 约 100 blocks，存在 56 个 SM 空闲
+  Persistent 动态分配可均衡负载，小规模收益相对明显
+  但 atomicAdd 开销依然存在，综合收益有限
+
+中大规模（1024+ tiles）：
+  Wave 切换开销 < 0.5%，Persistent 无明显优势
+  实测: Persistent 130.4 TFLOPS vs 普通 131.1 TFLOPS（略慢 0.5%）
+```
+
+**结论**：Persistent Kernel 适合 tiles 数量 ≤ 2 waves 的小规模问题。对于 GEMM 中大规模，普通多-wave 调度 + work-stealing 的收益与开销相抵。
+
+---
+
+*整理自 SM90 GEMM 手写优化实践，2026-04-01（补充 Cluster TMA Multicast 调试经验、多规模性能数据、Persistent Kernel 定量结论）*
