@@ -128,6 +128,37 @@ struct GemmConfig {
     ));
     using G2SCopyB = G2SCopyA;
 
+    // -------------------------------------------------------------------------
+    // Epilogue Copy: R->S->G 两级写回 (用于 cp.async kernel)
+    //
+    //   第一级 R->S: 累加器寄存器 (FP32) → SMEM buffer (SmemLayoutC)
+    //     R2SCopyAtomC: UniversalCopy<int> 每线程 4B，与 MMA C fragment 对齐
+    //   第二级 S->G: SMEM → GMEM, 128bit 向量化写回
+    //     S2GCopyC: 每线程一次搬 kVecLen 个 float (16B = 128bit)
+    //   SmemLayoutC: kTileM×kTileN row-major + Swizzle<3,3,3>，避免 bank conflict
+    // -------------------------------------------------------------------------
+    using SmemLayoutAtomC = decltype(composition(
+        Swizzle<3, 3, 3>{},
+        make_layout(make_shape(Int<kTileM>{}, Int<kTileN>{}),
+                    make_stride(Int<kTileN>{}, _1{}))
+    ));
+    using SmemLayoutC = decltype(tile_to_shape(
+        SmemLayoutAtomC{},
+        make_shape(Int<kTileM>{}, Int<kTileN>{})
+    ));
+
+    using R2SCopyAtomC = Copy_Atom<UniversalCopy<int>, AccumType>;
+
+    static constexpr int kColThreadsC = kTileN / kVecLen;
+    static constexpr int kRowThreadsC = 128 / kColThreadsC;
+    using S2GCopyAtomC = Copy_Atom<UniversalCopy<cute::uint128_t>, AccumType>;
+    using S2GCopyC = decltype(make_tiled_copy(
+        S2GCopyAtomC{},
+        make_layout(make_shape(Int<kRowThreadsC>{}, Int<kColThreadsC>{}),
+                    make_stride(Int<kColThreadsC>{}, _1{})),
+        make_layout(make_shape(_1{}, Int<kVecLen>{}))
+    ));
+
     // 单 WarpGroup kernel: 128 线程
     static constexpr int kNumThreads   = 128;
     // Ping-Pong kernel (v5/v6): Consumer WG (128 线程) + Producer 1 warp (32 线程) = 160 线程

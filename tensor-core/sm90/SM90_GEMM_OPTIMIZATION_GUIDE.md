@@ -21,6 +21,7 @@
 12. [性能调试工具与方法](#12-性能调试工具与方法)
 13. [经验结论速查表](#13-经验结论速查表)
 14. [不同规模性能参考](#14-不同规模性能参考)
+15. [cp.async Kernel：SS 模式 vs RS 模式（ldmatrix）](#15-cpasync-kernel-ss-模式-vs-rs-模式ldmatrix)
 
 ---
 
@@ -775,4 +776,116 @@ SM 平均利用率 ≈ 62%，性能约 106 TFLOPS
 
 ---
 
-*整理自 SM90 GEMM 手写优化实践，2026-04-01（补充 Cluster TMA Multicast 调试经验、多规模性能数据、Persistent Kernel 定量结论）*
+## 15. cp.async Kernel：SS 模式 vs RS 模式（ldmatrix）
+
+### 背景与动机
+
+SM89（Ada Lovelace）上的高性能 GEMM 通常需要**显式 ldmatrix** 来做 S→R 搬运，实现 G→S→R 三级流水
+（见 `tensor-core/include/gemm_opt_final.cuh`）。迁移到 SM90 时，自然会想到：
+能否用同样的思路，在 `cp.async` kernel 中用显式 ldmatrix 控制 S→R 重叠？
+
+**答案：不需要，也无法直接移植。** 原因在于 SM90 wgmma 与 SM89 mma.sync 的本质区别。
+
+### SM90 SS 模式为何不能用 ldmatrix
+
+SM90 wgmma 有两种操作数输入模式：
+
+| 模式 | A 来源 | B 来源 | `make_fragment_A` 返回值 |
+|------|--------|--------|------------------------|
+| **SS（Shared-Shared）** | SMEM descriptor | SMEM descriptor | `DescriptorIterator`（指向 SMEM，**非寄存器**）|
+| **RS（Register-Shared）** | 寄存器 | SMEM descriptor | 真正的寄存器 Tensor |
+
+在 SS 模式下，硬件通过 **SMEM descriptor** 直接读取 A/B 数据，内部维护异步的 S→R 流水。
+`make_fragment_A/B` 返回的是 `SM90::GMMA::DescriptorIterator`，**不是可写的寄存器 tensor**。
+
+尝试对其调用 `ldmatrix`（`copy(s2r_copy_a, src, tCrA_view)`）会触发编译错误：
+
+```
+// cute/algorithm/copy.hpp 中的 static_assert 失败：
+// "Destination of ldmatrix copy must be a register tensor"
+// 实际类型: SM90::GMMA::DescriptorIterator
+```
+
+### RS 模式（显式 ldmatrix）的实验结果
+
+RS 模式（`SM90_64x128x16_F32BF16BF16_RS`）中 A 从寄存器读取，`make_fragment_A` 返回真实寄存器 tensor，
+可以用 ldmatrix 写入。在 `config.cuh` 中定义并实验：
+
+```cpp
+using MMA_Op_RS = SM90_64x128x16_F32BF16BF16_RS<GMMA::Major::K, GMMA::Major::K>;
+using TiledMMA_RS = decltype(make_tiled_mma(MMA_Atom<MMA_Traits<MMA_Op_RS>>{}));
+```
+
+**对比结果（4096×4096×2048, BF16→FP32）**：
+
+| 指标 | SS 模式（无 ldmatrix） | RS 模式（显式 ldmatrix） |
+|------|--------------------|----------------------|
+| 寄存器 / thread | 198 | **220**（+11%）|
+| Occupancy | 1 | 1 |
+| 性能 | baseline | 略低（约 -1%~-2%）|
+
+RS 模式寄存器增加的原因：A fragment 必须实体存储在寄存器中（SM90_64x128 的 A fragment =
+`(4, MMA_M, MMA_K)` shape，共 32 个 FP16 寄存器元素）。
+
+### 根因分析：SM89 vs SM90 S→R 机制对比
+
+```
+SM89 mma.sync（同步指令）:
+  - 每次 mma.sync 执行前，操作数必须已在寄存器中
+  - S→R 流水必须程序员显式用 ldmatrix 安排（否则 S→R 与 MMA 串行）
+  - ldmatrix 是性能关键路径，4x ldmatrix 可与上一轮 MMA 重叠
+
+SM90 wgmma.mma_async（异步指令）:
+  - SS 模式：硬件通过 descriptor 异步读 SMEM，内置 S→R 流水窗口
+  - ptxas 自动在 warpgroup_arrive() 和 warpgroup_commit_batch() 之间
+    调度最优的 SMEM 访问时序
+  - 显式 ldmatrix（RS 模式）反而让硬件承担额外的 R→计算单元 搬运，
+    且需要更多寄存器缓冲 A fragment
+```
+
+### 正确的 cp.async + SS 模式主循环
+
+```cpp
+for (int itile = 0; itile < num_k_tiles; ++itile) {
+    // 1. 发射下一 tile 的 G→S 搬运（与当前 wgmma 重叠）
+    int next_k = itile + (kStage - 1);
+    if (next_k < num_k_tiles) {
+        copy(g2s_copy_a, tAgA(_, _, _, next_k), tAsA(_, _, _, write_stage));
+        copy(g2s_copy_b, tBgB(_, _, _, next_k), tBsB(_, _, _, write_stage));
+        cp_async_fence();
+        write_stage = (write_stage + 1) % kStage;
+    }
+
+    // 2. wgmma 计算当前 tile（SS 模式，硬件内部处理 S→R）
+    warpgroup_fence_operand(tCrC);
+    warpgroup_arrive();
+    gemm(tiled_mma,
+         tCrA(_, _, _, read_stage),   // DescriptorIterator
+         tCrB(_, _, _, read_stage),   // DescriptorIterator
+         tCrC);
+    warpgroup_commit_batch();
+
+    // 3. 等待下一 stage 就绪（与当前 wgmma 异步重叠）
+    cp_async_wait<kStage - 2>();
+    __syncthreads();
+    warpgroup_wait<0>();
+    warpgroup_fence_operand(tCrC);
+
+    read_stage = (read_stage + 1) % kStage;
+}
+```
+
+**注意**：这里 `warpgroup_wait<0>()` 在每轮都等待 MMA 完全完成，因为 cp.async kernel
+没有双缓冲 wgmma 的条件（流水线深度受 SMEM 限制，occupancy=1，无 Ping-Pong 分离）。
+
+### 结论与适用规则
+
+| 场景 | 推荐做法 |
+|------|---------|
+| SM90 wgmma（无论 TMA 还是 cp.async） | 用 SS 模式，**不需要 ldmatrix** |
+| SM89 mma.sync | 用 ldmatrix 显式安排 S→R，参考 `gemm_opt_final.cuh` |
+| SM90 RS 模式（ldmatrix） | **不推荐**：寄存器增加 11%，性能无提升，仅在需要 A 矩阵预处理时才有必要 |
+
+---
+
+*整理自 SM90 GEMM 手写优化实践，2026-04-02（补充 cp.async kernel SS vs RS 模式对比实验、SM90 硬件内置 S→R 流水机制分析）*

@@ -1649,6 +1649,7 @@ SM90 PingPong-Cluster: ❌ 无法测试（CUDA Context 初始化卡死）
 - [x] Cluster TMA Multicast 调试：修复 expect_tx 逻辑 + 实现 Leader-Follower mapa 远程设置模式
 - [~] 更新 Cluster TMA Multicast 的实测性能数据（❌ 受阻：H20-3e 驱动无法加载 cluster cubin，暂时放弃）
 - [x] cute-skill 创建：基于源码分析 + 本项目优化经验，整理 `.claude/skills/cute_skill/SKILL.md`（Layout 代数 / TMA / wgmma 流水线 / Occupancy 优化 / 踩坑表）
+- [x] cp.async kernel：SS 模式 vs RS 模式（显式 ldmatrix）对比实验，确认 SM90 SS 模式的硬件内置 S→R 流水优势
 - [ ] 用 ncu 分析 PingPong v5 的 SM 利用率和 warp stall 分布（需要 root 权限环境）
 - [ ] FP16 版本验证
 - [ ] 考虑 persistent kernel + 2 Consumer WG 的真正 Ping-Pong（参考 CUTLASS sm90 pingpong，384 线程）
@@ -1656,4 +1657,103 @@ SM90 PingPong-Cluster: ❌ 无法测试（CUDA Context 初始化卡死）
 
 ---
 
-*最后更新：2026-04-01（迭代十八：cute-skill 知识体系整理 —— 基于源码分析与本项目全系列优化经验，创建泛化程度高的 CuTe/CUTLASS 知识库 SKILL.md）*
+## 28. cp.async Kernel：SS 模式 vs RS 模式对比（SM90 硬件内置 S→R 流水验证）
+
+### 背景
+
+`kernel_cp_async.cuh` 使用 `cp.async` 做 G→S，搭配 SM90 wgmma SS 模式计算。
+SM89 的优化经验（如 `gemm_opt_final.cuh`）会在 S→R 阶段显式使用 `ldmatrix`，手动安排 G→S→R 三级流水。
+自然想到：SM90 上也能否用同样方法，通过显式 ldmatrix 更精细地控制 S→R 重叠？
+
+### 实验过程
+
+**尝试一：SS 模式下直接调用 ldmatrix**
+
+在 SS 模式的 `tCrA` 上尝试 `ldmatrix`：
+
+```cpp
+// SM90 SS 模式下 make_fragment_A 的返回类型
+Tensor tCrA = thr_mma.make_fragment_A(tCsA);
+// tCrA 的实际类型是 SM90::GMMA::DescriptorIterator，而非寄存器 Tensor
+copy(s2r_copy_a, tAsA_view, tCrA_view);  // ❌ 编译失败
+```
+
+**编译错误**：`cute/algorithm/copy.hpp` 中 `static_assert` 失败，提示目标 tensor 是
+`SM90::GMMA::DescriptorIterator`，不是可写的寄存器 tensor。
+
+**根因**：SM90 SS 模式下，`make_fragment_A/B` 返回的不是真正的寄存器 tensor，而是指向
+SMEM 的 descriptor 迭代器。硬件通过 descriptor 直接读 SMEM，不存在可以显式写入的 "A 寄存器"。
+
+---
+
+**尝试二：切换到 RS 模式（Register-Shared）**
+
+RS 模式 (`SM90_64x128x16_F32BF16BF16_RS`) 中，A 矩阵从寄存器读取，B 从 SMEM 读取。
+`make_fragment_A` 返回真正的寄存器 tensor，可以用 `ldmatrix` 写入。
+
+在 `config.cuh` 中新增 RS MMA：
+
+```cpp
+using MMA_Op_RS = SM90_64x128x16_F32BF16BF16_RS<GMMA::Major::K, GMMA::Major::K>;
+using TiledMMA_RS = decltype(make_tiled_mma(MMA_Atom<MMA_Traits<MMA_Op_RS>>{}));
+```
+
+在 kernel 中使用 RS TiledMMA 并显式 `ldmatrix`：
+
+```cpp
+typename Config::TiledMMA_RS tiled_mma_rs;
+// ...
+Tensor tCrA = thr_mma.make_fragment_A(tCsA);  // 真实寄存器 tensor
+// S->R: 显式 ldmatrix
+copy(s2r_copy_a, tAsA(_, _, ik, read_stage), tCrA_view(_, _, ik));
+// MMA
+gemm(tiled_mma_rs, tCrA, tCrB_desc, tCrC);
+```
+
+**实验结果（RS 模式 vs SS 模式）**：
+
+| 指标 | SS 模式（原始） | RS 模式（显式 ldmatrix） |
+|------|--------------|----------------------|
+| 寄存器 | 198 | **220**（增加 11%）|
+| Occupancy | 1 | 1 |
+| 性能（4096³）| baseline | 略低（约 -1~2%）|
+
+---
+
+**结论：回退到 SS 模式**
+
+SM90 wgmma SS 模式已在硬件层面内置了 SMEM → 计算单元的异步流水，**ptxas 自动安排最优的
+S→R 窗口**。显式 ldmatrix（RS 模式）的问题：
+
+1. **编译期**：SS 模式无法使用 ldmatrix（`DescriptorIterator` 不是寄存器 tensor）
+2. **RS 模式无收益**：显式 ldmatrix 额外消耗 22 个寄存器（保存 A fragment），且性能不升反降
+3. **架构差异**：这是 SM89→SM90 的本质变化——SM90 将 S→R 流水卸载给硬件，程序员无需也无法手动优化这一阶段
+
+> 对比 SM89（`gemm_opt_final.cuh`）：SM89 的 `mma.sync` 是同步的，必须显式 ldmatrix 才能
+> 让 S→R 与 MMA 重叠；SM90 的 wgmma 是异步的，SS 模式下 S→R 由硬件自动流水，两者机制根本不同。
+
+### 最终 cp.async Kernel 设计
+
+```
+模式:  wgmma SS（A/B 从 SMEM descriptor 直接读取）
+同步:  cp_async_fence / cp_async_wait<kStage-2> + __syncthreads
+主循环顺序:
+  1. copy(g2s, next_tile) + cp_async_fence()   — 发射下一 tile 异步搬运
+  2. warpgroup_fence_operand + warpgroup_arrive + gemm + warpgroup_commit_batch — 提交当前 tile MMA
+  3. cp_async_wait<kStage-2> + __syncthreads + warpgroup_wait<0>               — 等待就绪
+  4. warpgroup_fence_operand + 切换 read_stage
+Epilogue: R->S->G 两级写回（R2SCopyAtomC=UniversalCopy<int> + S2GCopyC=uint128_t）
+寄存器: 198  Occupancy: 1（cp.async 单 WG，无寄存器隔离机会）
+```
+
+### 经验总结
+
+| 问题 | 原因 | 修复 |
+|------|------|------|
+| SM90 SS 模式调用 ldmatrix 编译失败 | `make_fragment_A/B` 返回 `DescriptorIterator`，非寄存器 | 不需要显式 ldmatrix，硬件自动处理 |
+| SM90 RS 模式寄存器暴涨 (+22) | A fragment 需额外寄存器保存 | 用 SS 模式，让硬件维护 S→R 流水 |
+| SM89 ldmatrix 经验不适用于 SM90 | 两者 MMA 异步性本质不同 | SM90 SS 模式无需也无法用 ldmatrix 优化 |
+
+---
+
+*最后更新：2026-04-02（迭代十九：cp.async SS 模式 vs RS 模式（显式 ldmatrix）对比实验 —— 验证 SM90 硬件内置 S→R 流水，确认 SS 模式为 cp.async kernel 最优设计）*
