@@ -5,7 +5,6 @@
 .Spotlight-V100
 .Trashes
 
-/ptx-isa-markdown
 /.claude
-/hpc-ops
-/DeepGEMM
+/3rd
+/build

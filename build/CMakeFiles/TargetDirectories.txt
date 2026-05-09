@@ -1,3 +1,0 @@
-/home/lfy/cpp/cutlass_demo/build/CMakeFiles/cutlass_simple_demo.dir
-/home/lfy/cpp/cutlass_demo/build/CMakeFiles/edit_cache.dir
-/home/lfy/cpp/cutlass_demo/build/CMakeFiles/rebuild_cache.dir
